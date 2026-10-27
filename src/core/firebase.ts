@@ -1,8 +1,11 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, signOut } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import { getPrebootSessionState, SessionBootstrapState } from './prebootAuthGuard';
 import { FirestoreErrorInfo, OperationType } from './types';
+
+export type { SessionBootstrapState };
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -10,6 +13,14 @@ export const auth = getAuth(app);
 
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+export function isTokenServiceDisabledError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('token-service-api-has-not-been-used') ||
+    msg.includes('securetoken.googleapis.com')
+  );
+}
 
 /**
  * Validates initial connectivity to Firestore server as required by Firebase integration guidelines.
@@ -24,7 +35,46 @@ async function testConnection(): Promise<void> {
   }
 }
 
-void testConnection();
+let bootstrapPromise: Promise<SessionBootstrapState> | null = null;
+
+export function bootstrapFirebaseSession(): Promise<SessionBootstrapState> {
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async (): Promise<SessionBootstrapState> => {
+      const initial = getPrebootSessionState();
+      let sessionExpiredReset = initial.sessionExpiredReset;
+      let tokenServiceDisabled = initial.tokenServiceDisabled;
+      let activationUrl = initial.activationUrl;
+
+      try {
+        await auth.authStateReady();
+        if (auth.currentUser) {
+          try {
+            await auth.currentUser.getIdToken(false);
+          } catch (tokenErr) {
+            sessionExpiredReset = true;
+            if (isTokenServiceDisabledError(tokenErr)) {
+              tokenServiceDisabled = true;
+              const projNum = firebaseConfig.messagingSenderId || firebaseConfig.projectId;
+              activationUrl = `https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=${projNum}`;
+            }
+            await signOut(auth);
+          }
+        }
+      } catch {
+        // Proceed to connectivity test
+      }
+
+      await testConnection();
+
+      return {
+        sessionExpiredReset,
+        tokenServiceDisabled,
+        activationUrl,
+      };
+    })();
+  }
+  return bootstrapPromise;
+}
 
 /**
  * Standardized Firestore permission/operation error handler producing structured JSON diagnostics.
@@ -61,14 +111,20 @@ export function handleFirestoreError(
 export function friendlyErrorMessageAr(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
 
+  if (isTokenServiceDisabledError(err)) {
+    return 'انتهت صلاحية رمز الجلسة بعد مرور ساعة وتعذّر التجديد التلقائي لأن خدمة Token Service API غير مفعّلة في مشروع Google Cloud. سجّل الدخول مجددًا بحساب Google للمتابعة فورًا.';
+  }
+
   if (raw.includes('Quota exceeded')) {
     return 'تم تجاوز حصة القراءة/الكتابة اليومية المجانية في Firestore. ستُعاد الحصة تلقائيًا في اليوم التالي.';
   }
 
-  // Parse structured FirestoreErrorInfo if thrown by handleFirestoreError
   if (raw.startsWith('{') && raw.includes('"operationType"')) {
     try {
       const parsed = JSON.parse(raw) as FirestoreErrorInfo;
+      if (isTokenServiceDisabledError(parsed.error)) {
+        return 'انتهت صلاحية الجلسة السحابية؛ يرجى تسجيل الدخول مجددًا بحساب Google لتجديد الرمز فورًا.';
+      }
       if (parsed.error.includes('Quota exceeded')) {
         return 'تم تجاوز حصة الاستخدام اليومية المجانية لقاعدة البيانات السحابية.';
       }
@@ -76,7 +132,7 @@ export function friendlyErrorMessageAr(err: unknown): string {
         return 'رفضت قواعد الأمان السحابية هذه العملية. تأكد من توثيق البريد الإلكتروني وصلاحية الجلسة.';
       }
       if (parsed.error.includes('offline') || parsed.error.includes('unavailable')) {
-        return 'لا يوجد اتصال مستقر بالخادم السحابي حاليًا. تحقق من الإنترنت وأعد المحاولة.';
+        return 'تعذّر الوصول إلى الخادم السحابي حاليًا. إذا مضت ساعة على تسجيل دخولك، بدّل الحساب أو سجّل الدخول مجددًا لتجديد الجلسة.';
       }
     } catch {
       // Fall through

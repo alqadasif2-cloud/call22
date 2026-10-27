@@ -1,10 +1,20 @@
 import React, { useState } from 'react';
-import { signOut, User } from 'firebase/auth';
-import { CheckCircle2, Lock, LogOut, RotateCcw, Server, Shield, Trash2 } from 'lucide-react';
+import { GoogleAuthProvider, reauthenticateWithPopup, signOut, User } from 'firebase/auth';
+import {
+  CheckCircle2,
+  Copy,
+  Lock,
+  LogOut,
+  RotateCcw,
+  Server,
+  Shield,
+  Smartphone,
+  Trash2,
+} from 'lucide-react';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { CloudRepo, LiveCloudCheckResult } from '../core/cloudRepo';
 import { KeyVault, PBKDF2_ITERATIONS } from '../core/crypto';
-import { auth, friendlyErrorMessageAr } from '../core/firebase';
+import { auth, friendlyErrorMessageAr, googleProvider } from '../core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore, LocalQueueDb } from '../core/localQueue';
 import { ConfirmModal } from './Dialogs';
 
@@ -27,8 +37,45 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
   const [busy, setBusy] = useState(false);
   const [checkingServer, setCheckingServer] = useState(false);
   const [serverCheck, setServerCheck] = useState<LiveCloudCheckResult | null>(null);
+  const [pairingToken, setPairingToken] = useState<string | null>(null);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [pairingCopied, setPairingCopied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const handleGenerateAndroidPairingToken = async () => {
+    setPairingBusy(true);
+    setError(null);
+    setPairingCopied(false);
+    try {
+      const res = await reauthenticateWithPopup(user, googleProvider);
+      const cred = GoogleAuthProvider.credentialFromResult(res);
+      if (!cred?.idToken) {
+        throw new Error('تعذّر استخراج رمز الربط من جلسة Google.');
+      }
+      setPairingToken(cred.idToken);
+      try {
+        await navigator.clipboard.writeText(cred.idToken);
+        setPairingCopied(true);
+      } catch {
+        // User can tap copy button manually if browser blocks automatic clipboard write after popup
+      }
+    } catch (err) {
+      setError(friendlyErrorMessageAr(err));
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+
+  const handleCopyPairingToken = async () => {
+    if (!pairingToken) return;
+    try {
+      await navigator.clipboard.writeText(pairingToken);
+      setPairingCopied(true);
+    } catch {
+      setError('تعذّر النسخ التلقائي إلى الحافظة.');
+    }
+  };
 
   const handleVerifyLiveServer = async () => {
     setCheckingServer(true);
@@ -217,7 +264,56 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
             </div>
           </div>
 
-          <div className="mt-6 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
+          <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-900">
+                <Smartphone className="h-4 w-4 text-[#1F3A5F]" />
+                <span>ربط تطبيقي الهاتف (APK) بنفس الخزنة السحابية</span>
+              </div>
+              <button
+                type="button"
+                disabled={pairingBusy}
+                onClick={() => void handleGenerateAndroidPairingToken()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap shrink-0"
+              >
+                <span>{pairingBusy ? 'جاري الإصدار...' : 'إصدار رمز ربط تطبيق الهاتف'}</span>
+              </button>
+            </div>
+            <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
+              لتسجيل الدخول في ملفي الأندرويد (<span className="font-mono">backup-app</span> و
+              <span className="font-mono">viewer-app</span>) بنفس حسابك دون أي إعدادات، أصدر رمز الربط هنا ثم اضغط «لصق رمز الربط من الحافظة والدخول» داخل تطبيق الهاتف.
+            </p>
+            {pairingToken && (
+              <div className="mt-3 flex items-center gap-2">
+                <input
+                  type="text"
+                  readOnly
+                  dir="ltr"
+                  value={pairingToken}
+                  className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-700"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleCopyPairingToken()}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-[#1F3A5F] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#162a47] whitespace-nowrap shrink-0"
+                >
+                  {pairingCopied ? (
+                    <>
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      <span>تم النسخ</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>نسخ الرمز</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
             <button
               type="button"
               onClick={() => void handleLockNow()}

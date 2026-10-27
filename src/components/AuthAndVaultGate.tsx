@@ -3,15 +3,21 @@ import { signInWithPopup, signOut, User } from 'firebase/auth';
 import { KeyRound, Lock, LogIn, LogOut, ShieldCheck } from 'lucide-react';
 import { CloudRepo } from '../core/cloudRepo';
 import { KeyVault } from '../core/crypto';
-import { auth, friendlyErrorMessageAr, googleProvider } from '../core/firebase';
+import {
+  auth,
+  friendlyErrorMessageAr,
+  googleProvider,
+  SessionBootstrapState,
+} from '../core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore } from '../core/localQueue';
 import { RecordType } from '../core/types';
 
 interface SignInLandingProps {
   onSignedIn?: () => void;
+  sessionNotice?: SessionBootstrapState | null;
 }
 
-export const SignInLanding: React.FC<SignInLandingProps> = () => {
+export const SignInLanding: React.FC<SignInLandingProps> = ({ sessionNotice }) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -42,6 +48,31 @@ export const SignInLanding: React.FC<SignInLandingProps> = () => {
             الخاصة، لتستعرضها أو تصدّرها متى شئت. يُشتق مفتاح التشفير على جهازك فقط من عبارة مرورك،
             ولا تغادر العبارة ولا المفتاح متصفحك أبدًا.
           </p>
+
+          {sessionNotice?.sessionExpiredReset && (
+            <div className="mt-6 max-w-xl rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-relaxed text-amber-950">
+              <div className="font-bold text-amber-900">انتهت صلاحية الجلسة السابقة (60 دقيقة)</div>
+              <p className="mt-1">
+                اضغط <strong>«المتابعة باستخدام حساب Google»</strong> أدناه لإصدار جلسة جديدة والاتصال
+                بقاعدة البيانات فورًا.
+              </p>
+              {sessionNotice.tokenServiceDisabled && sessionNotice.activationUrl && (
+                <p className="mt-1.5">
+                  لتفعيل التجديد التلقائي للجلسات في الخلفية دون الحاجة لإعادة الدخول كل ساعة، يمكنك
+                  تفعيل خدمة{' '}
+                  <a
+                    href={sessionNotice.activationUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-semibold underline hover:text-amber-800"
+                  >
+                    Token Service API في مشروع Google Cloud
+                  </a>{' '}
+                  بضغطة واحدة.
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="mt-8 flex flex-wrap items-center gap-4">
             <button

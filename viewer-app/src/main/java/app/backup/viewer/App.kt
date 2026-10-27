@@ -6,6 +6,6 @@ import app.backup.core.CloudInit
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
-        CloudInit.configure()
+        CloudInit.configure(this)
     }
 }

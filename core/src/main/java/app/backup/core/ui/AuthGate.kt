@@ -1,5 +1,9 @@
 package app.backup.core.ui
 
+import android.app.Activity
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -11,7 +15,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -34,8 +41,16 @@ import app.backup.core.CloudRepo
 import app.backup.core.KeyVault
 import app.backup.core.Session
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.auth.OAuthProvider
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
 
 /** بوابة: تسجيل الدخول ← عبارة مرور التشفير ← المحتوى. */
 @Composable
@@ -76,39 +91,101 @@ fun AuthGate(content: @Composable () -> Unit) {
 
 @Composable
 private fun LoginScreen(auth: FirebaseAuth) {
+    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    var pairToken by remember { mutableStateOf("") }
+    var showEmailForm by remember { mutableStateOf(false) }
     var email by remember { mutableStateOf("") }
     var pw by remember { mutableStateOf("") }
     var register by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
+    fun signInWithPairToken(rawToken: String) {
+        val tok = rawToken.trim()
+        if (tok.isEmpty()) {
+            error = "انسخ رمز الربط أولًا من تبويب «الأمان والحساب» في تطبيق الويب."
+            return
+        }
+        scope.launch {
+            busy = true; error = null
+            try {
+                auth.signInWithCredential(GoogleAuthProvider.getCredential(tok, null)).await()
+            } catch (e: Exception) {
+                error = AuthMessages.of(e)
+            } finally {
+                busy = false
+            }
+        }
+    }
+
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        Text(if (register) "إنشاء حساب" else "تسجيل الدخول", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(16.dp))
-        OutlinedTextField(
-            email, { email = it }, label = { Text("البريد الإلكتروني") }, singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth(),
-        )
+        Text("تسجيل الدخول والربط السحابي", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            pw, { pw = it }, label = { Text("كلمة المرور (8 أحرف على الأقل)") }, singleLine = true,
-            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+        Text(
+            "اربط هذا الهاتف مباشرةً بنفس حسابك وخزنتك المشفّرة في تطبيق الويب بضغطة واحدة دون أي إعدادات يدوية.",
+            style = MaterialTheme.typography.bodyMedium,
         )
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 8.dp)) }
         Spacer(Modifier.height(16.dp))
-        Button(
-            enabled = !busy && email.isNotBlank() && pw.length >= 8,
+
+        OutlinedCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp)) {
+                Text("الربط الفوري مع تطبيق الويب (موصى به)", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "من تبويب «الأمان والحساب» في تطبيق الويب اضغط «إصدار رمز ربط تطبيق الهاتف»، ثم اضغط الزر أدناه للدخول فورًا.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = {
+                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        val clip = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                            ?.getItemAt(0)?.coerceToText(ctx)?.toString()?.trim().orEmpty()
+                        if (clip.isNotEmpty()) pairToken = clip
+                        signInWithPairToken(pairToken)
+                    },
+                ) { Text("لصق رمز الربط من الحافظة والدخول") }
+
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    pairToken,
+                    { pairToken = it },
+                    label = { Text("أو الصق رمز الربط يدويًا هنا") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (pairToken.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { signInWithPairToken(pairToken) },
+                    ) { Text("دخول بالرمز الملصوق") }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
             onClick = {
+                val act = ctx.findActivity()
+                if (act == null) {
+                    error = "تعذّر فتح نافذة المصادقة."
+                    return@OutlinedButton
+                }
                 scope.launch {
                     busy = true; error = null
                     try {
-                        if (register) auth.createUserWithEmailAndPassword(email.trim(), pw).await()
-                        else auth.signInWithEmailAndPassword(email.trim(), pw).await()
+                        val provider = OAuthProvider.newBuilder("google.com").build()
+                        auth.startActivityForSignInWithProvider(act, provider).await()
                     } catch (e: Exception) {
                         error = AuthMessages.of(e)
                     } finally {
@@ -116,9 +193,50 @@ private fun LoginScreen(auth: FirebaseAuth) {
                     }
                 }
             },
-        ) { Text(if (register) "إنشاء الحساب" else "دخول") }
-        TextButton(onClick = { register = !register; error = null }) {
-            Text(if (register) "لدي حساب — تسجيل الدخول" else "ليس لدي حساب — إنشاء حساب")
+        ) { Text("الدخول عبر متصفح Google") }
+
+        error?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, color = MaterialTheme.colorScheme.error)
+        }
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+        TextButton(onClick = { showEmailForm = !showEmailForm; error = null }) {
+            Text(if (showEmailForm) "إخفاء الدخول بالبريد وكلمة المرور" else "الدخول بالبريد الإلكتروني وكلمة المرور")
+        }
+
+        if (showEmailForm) {
+            OutlinedTextField(
+                email, { email = it }, label = { Text("البريد الإلكتروني") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                pw, { pw = it }, label = { Text("كلمة المرور (8 أحرف على الأقل)") }, singleLine = true,
+                visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(12.dp))
+            Button(
+                enabled = !busy && email.isNotBlank() && pw.length >= 8,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    scope.launch {
+                        busy = true; error = null
+                        try {
+                            if (register) auth.createUserWithEmailAndPassword(email.trim(), pw).await()
+                            else auth.signInWithEmailAndPassword(email.trim(), pw).await()
+                        } catch (e: Exception) {
+                            error = AuthMessages.of(e)
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+            ) { Text(if (register) "إنشاء الحساب" else "دخول") }
+            TextButton(onClick = { register = !register; error = null }) {
+                Text(if (register) "لدي حساب — تسجيل الدخول" else "ليس لدي حساب — إنشاء حساب")
+            }
         }
     }
 }

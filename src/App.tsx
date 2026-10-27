@@ -12,7 +12,13 @@ import { ExportModal } from './components/Dialogs';
 import { RecordsExplorerView } from './components/RecordsExplorerView';
 import { SecurityAndAccountView } from './components/SecurityAndAccountView';
 import { CloudRepo } from './core/cloudRepo';
-import { auth, friendlyErrorMessageAr } from './core/firebase';
+import {
+  auth,
+  bootstrapFirebaseSession,
+  friendlyErrorMessageAr,
+  isTokenServiceDisabledError,
+  SessionBootstrapState,
+} from './core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore } from './core/localQueue';
 import { DeviceInfo } from './core/types';
 
@@ -58,6 +64,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryS
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState<User | null>(null);
+  const [sessionNotice, setSessionNotice] = useState<SessionBootstrapState | null>(null);
   const [vaultKey, setVaultKey] = useState<CryptoKey | null>(null);
   const [prefs, setPrefs] = useState<LocalDevicePrefs | null>(null);
   const [section, setSection] = useState<ActiveSection>('devices');
@@ -66,19 +73,98 @@ export default function App() {
   const [cloudRefreshCounter, setCloudRefreshCounter] = useState(0);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (nextUser) => {
-      setUser(nextUser);
-      setVaultKey(null);
-      setSelectedDevice(null);
-      setExportDevice(null);
-      if (nextUser) {
-        setPrefs(LocalPrefsStore.load(nextUser.uid));
-      } else {
-        setPrefs(null);
+    let disposed = false;
+    let unsubAuth: (() => void) | null = null;
+    let expiryTimer: number | null = null;
+
+    const clearExpiryTimer = () => {
+      if (expiryTimer !== null) {
+        window.clearTimeout(expiryTimer);
+        expiryTimer = null;
       }
-      setAuthReady(true);
-    });
-    return () => unsub();
+    };
+
+    void (async () => {
+      const boot = await bootstrapFirebaseSession();
+      if (disposed) return;
+      if (boot.sessionExpiredReset) {
+        setSessionNotice(boot);
+      }
+
+      unsubAuth = onAuthStateChanged(auth, (nextUser) => {
+        clearExpiryTimer();
+        void (async () => {
+          if (nextUser) {
+            try {
+              const tokenResult = await nextUser.getIdTokenResult(false);
+              if (disposed) return;
+              setSessionNotice(null);
+              setUser(nextUser);
+              setVaultKey(null);
+              setSelectedDevice(null);
+              setExportDevice(null);
+              setPrefs(LocalPrefsStore.load(nextUser.uid));
+
+              // Proactively verify token refresh 45s before expiration so Firestore never hits a stale token
+              const expMs = Date.parse(tokenResult.expirationTime);
+              if (!Number.isNaN(expMs)) {
+                const msUntilCheck = Math.max(10_000, expMs - Date.now() - 45_000);
+                expiryTimer = window.setTimeout(() => {
+                  void (async () => {
+                    try {
+                      await nextUser.getIdToken(true);
+                    } catch (err) {
+                      const disabled = isTokenServiceDisabledError(err);
+                      await auth.signOut();
+                      if (!disposed) {
+                        setSessionNotice({
+                          sessionExpiredReset: true,
+                          tokenServiceDisabled: disabled,
+                          activationUrl: disabled
+                            ? 'https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=634918323270'
+                            : null,
+                        });
+                      }
+                    }
+                  })();
+                }, msUntilCheck);
+              }
+            } catch (err) {
+              const disabled = isTokenServiceDisabledError(err);
+              await auth.signOut();
+              if (!disposed) {
+                setUser(null);
+                setPrefs(null);
+                setVaultKey(null);
+                setSessionNotice({
+                  sessionExpiredReset: true,
+                  tokenServiceDisabled: disabled,
+                  activationUrl: disabled
+                    ? 'https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=634918323270'
+                    : null,
+                });
+              }
+            }
+          } else if (!disposed) {
+            setUser(null);
+            setVaultKey(null);
+            setSelectedDevice(null);
+            setExportDevice(null);
+            setPrefs(null);
+          }
+
+          if (!disposed) {
+            setAuthReady(true);
+          }
+        })();
+      });
+    })();
+
+    return () => {
+      disposed = true;
+      clearExpiryTimer();
+      if (unsubAuth) unsubAuth();
+    };
   }, []);
 
   const handlePrimaryExportAction = async () => {
@@ -228,7 +314,7 @@ export default function App() {
               <div className="mt-4 h-4 w-96 max-w-full rounded bg-slate-100" />
             </div>
           ) : !user ? (
-            <SignInLanding />
+            <SignInLanding sessionNotice={sessionNotice} />
           ) : !vaultKey && prefs ? (
             <VaultPassphraseGate
               user={user}

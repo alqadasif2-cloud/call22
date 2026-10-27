@@ -1,6 +1,9 @@
 package app.backup.core
 
+import android.content.Context
+import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.FirebaseOptions
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
@@ -8,23 +11,54 @@ import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.FirebaseAuthWeakPasswordException
-import com.google.firebase.firestore.AggregateSource
+import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.MemoryCacheSettings
-import com.google.firebase.firestore.Query
-import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 object CloudInit {
+    private const val DEFAULT_PROJECT_ID = "micro-volt-75v9p"
+    private const val DEFAULT_APP_ID = "1:634918323270:android:9a6d13baf4427401"
+    private const val DEFAULT_API_KEY = "AIzaSyBIcm5I9VXMrAgdrsSbKbLA_9dYMRCWn7Q"
+    private const val DEFAULT_SENDER_ID = "634918323270"
+    private const val DEFAULT_STORAGE_BUCKET = "micro-volt-75v9p.firebasestorage.app"
+    const val PROVISIONED_DB_ID = "ai-studio-9b45ca49-21a0-4eb7-af13-f761f2dd91e9"
+
+    @Volatile
+    var databaseId: String = PROVISIONED_DB_ID
+
+    fun firestore(): FirebaseFirestore {
+        val app = FirebaseApp.getInstance()
+        val useNamedDb = app.options.projectId == DEFAULT_PROJECT_ID &&
+            databaseId.isNotBlank() &&
+            databaseId != "(default)"
+        return if (useNamedDb) {
+            FirebaseFirestore.getInstance(databaseId)
+        } else {
+            FirebaseFirestore.getInstance()
+        }
+    }
+
     /** نستخدم Room كمخزن محلي وحيد، لذا نعطّل كاش Firestore الدائم كي لا تُعلَّق الكتابات بصمت دون تأكيد الخادم. */
-    fun configure() {
+    fun configure(ctx: Context? = null) {
         runCatching {
-            FirebaseFirestore.getInstance().firestoreSettings = FirebaseFirestoreSettings.Builder()
+            if (ctx != null && FirebaseApp.getApps(ctx).isEmpty()) {
+                val opts = FirebaseOptions.Builder()
+                    .setProjectId(DEFAULT_PROJECT_ID)
+                    .setApplicationId(DEFAULT_APP_ID)
+                    .setApiKey(DEFAULT_API_KEY)
+                    .setGcmSenderId(DEFAULT_SENDER_ID)
+                    .setStorageBucket(DEFAULT_STORAGE_BUCKET)
+                    .build()
+                FirebaseApp.initializeApp(ctx, opts)
+            }
+            firestore().firestoreSettings = FirebaseFirestoreSettings.Builder()
                 .setLocalCacheSettings(MemoryCacheSettings.newBuilder().build())
                 .build()
         }
@@ -33,11 +67,12 @@ object CloudInit {
 
 object AuthMessages {
     fun of(e: Throwable): String = when (e) {
-        is FirebaseAuthInvalidCredentialsException, is FirebaseAuthInvalidUserException -> "البريد أو كلمة المرور غير صحيحة"
+        is FirebaseAuthInvalidCredentialsException, is FirebaseAuthInvalidUserException -> "بيانات التحقق أو رمز الربط غير صالح أو منتهي الصلاحية"
         is FirebaseAuthUserCollisionException -> "هذا البريد مسجّل مسبقًا"
         is FirebaseAuthWeakPasswordException -> "كلمة المرور ضعيفة"
         is FirebaseAuthRecentLoginRequiredException -> "يلزم تسجيل دخول حديث. سجّل الخروج ثم الدخول وأعد المحاولة"
         is FirebaseNetworkException -> "لا يوجد اتصال بالإنترنت"
+        is FirebaseFirestoreException -> "تعذّرت العملية السحابية (${e.code.name})"
         else -> "تعذّر إتمام العملية (${e.javaClass.simpleName})"
     }
 }
@@ -45,7 +80,7 @@ object AuthMessages {
 data class PageResult(val items: List<EncRecord>, val cursor: DocumentSnapshot?, val exhausted: Boolean)
 
 class CloudRepo(
-    private val db: FirebaseFirestore = FirebaseFirestore.getInstance(),
+    private val db: FirebaseFirestore = CloudInit.firestore(),
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
 ) {
     private val uid: String get() = auth.currentUser?.uid ?: throw IllegalStateException("not signed in")
@@ -63,8 +98,13 @@ class CloudRepo(
         val box = Crypto.encrypt(key, CHECK_PLAIN, CHECK_AAD)
         cryptoDoc().set(
             mapOf(
-                "salt" to Crypto.b64(salt), "iter" to Crypto.ITERATIONS,
-                "checkIv" to Crypto.b64(box.iv), "check" to Crypto.b64(box.data), "v" to 1,
+                "uid" to uid,
+                "salt" to Crypto.b64(salt),
+                "iter" to Crypto.ITERATIONS,
+                "checkIv" to Crypto.b64(box.iv),
+                "check" to Crypto.b64(box.data),
+                "v" to 1,
+                "createdAt" to FieldValue.serverTimestamp(),
             )
         ).await()
         return key
@@ -78,8 +118,13 @@ class CloudRepo(
         val iter = (d.getLong("iter") ?: Crypto.ITERATIONS.toLong()).toInt()
         val key = withContext(Dispatchers.Default) { Crypto.deriveKey(pass, salt, iter) }
         return try {
-            Crypto.decrypt(key, Crypto.unb64(d.getString("checkIv")!!), Crypto.unb64(d.getString("check")!!), CHECK_AAD)
-            key
+            val plain = Crypto.decrypt(
+                key,
+                Crypto.unb64(d.getString("checkIv")!!),
+                Crypto.unb64(d.getString("check")!!),
+                CHECK_AAD,
+            )
+            if (plain.contentEquals(CHECK_PLAIN)) key else null
         } catch (e: Exception) {
             null
         }
@@ -87,44 +132,102 @@ class CloudRepo(
 
     // ---------- الأجهزة ----------
     suspend fun registerDevice(id: String, name: String, model: String, enabled: List<String>) {
-        devices().document(id).set(
-            mapOf("name" to name, "model" to model, "enabled" to enabled, "updatedAt" to FieldValue.serverTimestamp()),
-            SetOptions.merge(),
-        ).await()
+        val safeName = name.trim().ifEmpty { "هاتف أندرويد" }.take(100)
+        val safeModel = model.trim().ifEmpty { "Android" }.take(100)
+        val safeEnabled = enabled.filter { it in ALLOWED_TYPES }.distinct().take(3)
+        val ref = devices().document(id)
+        val snap = ref.get().await()
+        if (!snap.exists()) {
+            ref.set(
+                mapOf(
+                    "ownerId" to uid,
+                    "name" to safeName,
+                    "model" to safeModel,
+                    "enabled" to safeEnabled,
+                    "lastSyncAt" to 0L,
+                    "createdAt" to FieldValue.serverTimestamp(),
+                    "updatedAt" to FieldValue.serverTimestamp(),
+                )
+            ).await()
+        } else {
+            ref.update(
+                mapOf(
+                    "name" to safeName,
+                    "model" to safeModel,
+                    "enabled" to safeEnabled,
+                    "updatedAt" to FieldValue.serverTimestamp(),
+                )
+            ).await()
+        }
     }
 
     suspend fun markSynced(deviceId: String, at: Long) {
-        devices().document(deviceId).update("lastSyncAt", at).await()
+        devices().document(deviceId).update(
+            mapOf(
+                "lastSyncAt" to at.coerceAtLeast(0L),
+                "updatedAt" to FieldValue.serverTimestamp(),
+            )
+        ).await()
     }
 
-    suspend fun listDevices(): List<DeviceInfo> = devices().get().await().documents.map {
-        DeviceInfo(
-            id = it.id,
-            name = it.getString("name") ?: it.id,
-            model = it.getString("model") ?: "",
-            enabled = (it.get("enabled") as? List<*>)?.map { x -> x.toString() } ?: emptyList(),
-            lastSyncAt = it.getLong("lastSyncAt"),
-        )
-    }
+    suspend fun listDevices(): List<DeviceInfo> =
+        devices().whereEqualTo("ownerId", uid).get().await().documents.map {
+            val sync = it.getLong("lastSyncAt")
+            DeviceInfo(
+                id = it.id,
+                name = it.getString("name") ?: it.id,
+                model = it.getString("model") ?: "",
+                enabled = (it.get("enabled") as? List<*>)?.map { x -> x.toString() } ?: emptyList(),
+                lastSyncAt = if (sync != null && sync > 0L) sync else null,
+            )
+        }.sortedByDescending { it.lastSyncAt ?: 0L }
 
     suspend fun count(deviceId: String, type: RecordType? = null, from: Long? = null, to: Long? = null): Long {
-        var q: Query = records(deviceId)
-        if (type != null) q = q.whereEqualTo("type", type.id)
-        if (from != null) q = q.whereGreaterThanOrEqualTo("ts", from)
-        if (to != null) q = q.whereLessThanOrEqualTo("ts", to)
-        return q.count().get(AggregateSource.SERVER).await().count
+        val docs = records(deviceId).whereEqualTo("ownerId", uid).get().await().documents
+        return docs.count { d ->
+            val t = d.getString("type")
+            val ts = d.getLong("ts") ?: 0L
+            (type == null || t == type.id) &&
+                (from == null || ts >= from) &&
+                (to == null || ts <= to)
+        }.toLong()
     }
 
     // ---------- السجلات ----------
     /** يُستدعى بدفعات ≤ 400. المعرّف حتمي فالتكرار يستبدل نفس الوثيقة ولا ينشئ نسخة ثانية. */
     suspend fun upload(deviceId: String, recs: List<EncRecord>) {
         require(recs.size <= 400)
+        if (recs.isEmpty()) return
+        val existingIds = records(deviceId).whereEqualTo("ownerId", uid).get().await().documents
+            .mapTo(HashSet()) { it.id }
         val b = db.batch()
-        recs.forEach {
-            b.set(
-                records(deviceId).document(it.id),
-                mapOf("type" to it.type, "ts" to it.ts, "iv" to it.iv, "data" to it.data, "v" to 1),
-            )
+        recs.forEach { rec ->
+            val ref = records(deviceId).document(rec.id)
+            if (rec.id in existingIds) {
+                b.update(
+                    ref,
+                    mapOf(
+                        "iv" to rec.iv,
+                        "data" to rec.data,
+                        "updatedAt" to FieldValue.serverTimestamp(),
+                    )
+                )
+            } else {
+                b.set(
+                    ref,
+                    mapOf(
+                        "ownerId" to uid,
+                        "deviceId" to deviceId,
+                        "type" to rec.type,
+                        "ts" to rec.ts,
+                        "iv" to rec.iv,
+                        "data" to rec.data,
+                        "v" to 1,
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp(),
+                    )
+                )
+            }
         }
         b.commit().await()
     }
@@ -132,16 +235,33 @@ class CloudRepo(
     suspend fun page(
         deviceId: String, type: RecordType, from: Long?, to: Long?, after: DocumentSnapshot?, size: Long = 50,
     ): PageResult {
-        var q: Query = records(deviceId).whereEqualTo("type", type.id)
-        if (from != null) q = q.whereGreaterThanOrEqualTo("ts", from)
-        if (to != null) q = q.whereLessThanOrEqualTo("ts", to)
-        q = q.orderBy("ts", Query.Direction.DESCENDING)
-        if (after != null) q = q.startAfter(after)
-        val snap = q.limit(size).get().await()
-        val items = snap.documents.map {
-            EncRecord(it.id, it.getString("type")!!, it.getLong("ts")!!, it.getString("iv")!!, it.getString("data")!!)
+        val allMatching = records(deviceId).whereEqualTo("ownerId", uid).get().await().documents
+            .filter { d ->
+                val t = d.getString("type")
+                val ts = d.getLong("ts") ?: 0L
+                t == type.id &&
+                    (from == null || ts >= from) &&
+                    (to == null || ts <= to)
+            }
+            .sortedWith(compareByDescending<DocumentSnapshot> { it.getLong("ts") ?: 0L }.thenBy { it.id })
+
+        val startIdx = if (after == null) {
+            0
+        } else {
+            val idx = allMatching.indexOfFirst { it.id == after.id }
+            if (idx >= 0) idx + 1 else allMatching.size
         }
-        return PageResult(items, snap.documents.lastOrNull(), items.size < size)
+
+        val slice = allMatching.drop(startIdx).take(size.toInt())
+        val items = slice.mapNotNull { d ->
+            val t = d.getString("type") ?: return@mapNotNull null
+            val ts = d.getLong("ts") ?: return@mapNotNull null
+            val iv = d.getString("iv") ?: return@mapNotNull null
+            val data = d.getString("data") ?: return@mapNotNull null
+            EncRecord(d.id, t, ts, iv, data)
+        }
+        val exhausted = (startIdx + slice.size) >= allMatching.size
+        return PageResult(items, slice.lastOrNull(), exhausted)
     }
 
     // ---------- الحذف ----------
@@ -151,7 +271,7 @@ class CloudRepo(
 
     suspend fun deleteRecords(deviceId: String) {
         while (true) {
-            val snap = records(deviceId).limit(400).get().await()
+            val snap = records(deviceId).whereEqualTo("ownerId", uid).limit(350).get().await()
             if (snap.isEmpty) break
             val b = db.batch()
             snap.documents.forEach { b.delete(it.reference) }
@@ -164,10 +284,15 @@ class CloudRepo(
         devices().document(deviceId).delete().await()
     }
 
-    /** يعيد المصادقة بكلمة المرور، يحذف كل بيانات السحابة، ثم يحذف الحساب نفسه. */
+    /** يعيد المصادقة، يحذف كل بيانات السحابة، ثم يحذف الحساب نفسه. */
     suspend fun deleteAccount(password: String) {
         val u = auth.currentUser ?: throw IllegalStateException("not signed in")
-        u.reauthenticate(EmailAuthProvider.getCredential(u.email!!, password)).await()
+        val trimmed = password.trim()
+        if (trimmed.startsWith("eyJ")) {
+            u.reauthenticate(GoogleAuthProvider.getCredential(trimmed, null)).await()
+        } else if (trimmed.isNotEmpty() && u.email != null && u.providerData.any { it.providerId == "password" }) {
+            u.reauthenticate(EmailAuthProvider.getCredential(u.email!!, trimmed)).await()
+        }
         listDevices().forEach { deleteDevice(it.id) }
         cryptoDoc().delete().await()
         u.delete().await()
@@ -176,5 +301,6 @@ class CloudRepo(
     private companion object {
         val CHECK_PLAIN = "backup-check-v1".toByteArray()
         val CHECK_AAD = "check".toByteArray()
+        val ALLOWED_TYPES = setOf("call", "sms", "clip")
     }
 }

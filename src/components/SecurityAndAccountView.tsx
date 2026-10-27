@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { signOut, User } from 'firebase/auth';
-import { Lock, LogOut, RotateCcw, Shield, Trash2 } from 'lucide-react';
-import { CloudRepo } from '../core/cloudRepo';
+import { CheckCircle2, Lock, LogOut, RotateCcw, Server, Shield, Trash2 } from 'lucide-react';
+import firebaseConfig from '../../firebase-applet-config.json';
+import { CloudRepo, LiveCloudCheckResult } from '../core/cloudRepo';
 import { KeyVault, PBKDF2_ITERATIONS } from '../core/crypto';
 import { auth, friendlyErrorMessageAr } from '../core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore, LocalQueueDb } from '../core/localQueue';
@@ -24,8 +25,23 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
 }) => {
   const [confirmKind, setConfirmKind] = useState<ConfirmKind>(null);
   const [busy, setBusy] = useState(false);
+  const [checkingServer, setCheckingServer] = useState(false);
+  const [serverCheck, setServerCheck] = useState<LiveCloudCheckResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const handleVerifyLiveServer = async () => {
+    setCheckingServer(true);
+    setError(null);
+    try {
+      const res = await CloudRepo.verifyLiveCloudRoundtrip();
+      setServerCheck(res);
+    } catch (err) {
+      setError(friendlyErrorMessageAr(err));
+    } finally {
+      setCheckingServer(false);
+    }
+  };
 
   const handleResetSyncQueue = async () => {
     setBusy(true);
@@ -98,12 +114,50 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
 
   return (
     <div className="space-y-8">
-      <div className="border-b border-slate-200 pb-5">
-        <h1 className="text-2xl font-bold text-slate-900">الأمان والتحكم في البيانات</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          إعدادات التشفير الطرفي، قفل الجلسة، والتحكم الدقيق في البيانات المحلية والسحابية.
-        </p>
+      <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-5">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">الأمان والتحكم في البيانات</h1>
+          <p className="mt-1 text-sm text-slate-600">
+            تحقق مباشر من الخادم السحابي الفعلي، قفل الجلسة، والتحكم الدقيق في البيانات المحلية
+            والسحابية.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => void handleVerifyLiveServer()}
+          disabled={checkingServer}
+          className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
+        >
+          <Server className="h-3.5 w-3.5 text-[#1F3A5F]" />
+          <span>{checkingServer ? 'جاري التحقق من الخادم...' : 'فحص الاتصال الفعلي بـ Firestore'}</span>
+        </button>
       </div>
+
+      {serverCheck && (
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 text-sm text-emerald-950">
+          <div className="flex items-center gap-2 font-semibold text-emerald-800">
+            <CheckCircle2 className="h-4 w-4 shrink-0" />
+            <span>
+              اتصال سحابي حي ومؤكّد بقاعدة بيانات Google Cloud Firestore (زمن استجابة الخادم المباشر:{' '}
+              <span className="font-mono tabular-nums">{serverCheck.latencyMs}ms</span>)
+            </span>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-emerald-900">
+            <span>
+              معرّف المشروع السحابي:{' '}
+              <strong dir="ltr" className="font-mono">
+                {firebaseConfig.projectId}
+              </strong>
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              حالة وثيقة التشفير الجذرية (<span className="font-mono">meta/crypto</span>):{' '}
+              <strong>{serverCheck.hasCryptoDoc ? 'محفوظة وموثّقة على الخادم' : 'غير منشأة'}</strong>
+            </span>
+          </div>
+        </div>
+      )}
 
       {notice && (
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
@@ -121,14 +175,20 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
         <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-6">
           <div className="flex items-center gap-2.5">
             <Shield className="h-5 w-5 text-[#1F3A5F]" />
-            <h2 className="text-base font-bold text-slate-900">مواصفات الخزنة والحساب</h2>
+            <h2 className="text-base font-bold text-slate-900">مواصفات الخزنة والحساب الفعلي</h2>
           </div>
 
           <div className="mt-4 divide-y divide-slate-100 text-sm">
             <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">البريد الإلكتروني للحساب</span>
+              <span className="text-slate-600">البريد الإلكتروني الموثّق</span>
               <span dir="ltr" className="font-mono text-xs text-slate-900">
                 {user.email || user.uid}
+              </span>
+            </div>
+            <div className="flex items-center justify-between py-2.5">
+              <span className="text-slate-600">مشروع Firebase الفعلي</span>
+              <span dir="ltr" className="font-mono text-xs font-semibold text-slate-900">
+                {firebaseConfig.projectId}
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">

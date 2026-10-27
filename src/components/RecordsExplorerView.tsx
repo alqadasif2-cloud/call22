@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, Download, Search, Trash2 } from 'lucide-react';
 import { CloudRepo } from '../core/cloudRepo';
 import { decryptRecord } from '../core/crypto';
@@ -36,53 +36,64 @@ export const RecordsExplorerView: React.FC<RecordsExplorerViewProps> = ({
   const [recordToDelete, setRecordToDelete] = useState<PlainRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Real-time device list subscription
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const list = await CloudRepo.listDevices();
-        if (cancelled) return;
+    const unsub = CloudRepo.subscribeDevices(
+      (list) => {
         setDevices(list);
         if (!selectedDevice && list.length > 0) {
           onSelectDevice(list[0]);
         }
-      } catch (err) {
-        if (!cancelled) setError(friendlyErrorMessageAr(err));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+      },
+      (err) => setError(friendlyErrorMessageAr(err))
+    );
+    return () => unsub();
   }, [selectedDevice?.id]);
 
-  const loadDeviceRecords = useCallback(
-    async (dev: DeviceInfo) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const encList = await CloudRepo.listDeviceRecords(dev.id);
-        const plainList: PlainRecord[] = [];
-        for (const enc of encList) {
-          plainList.push(await decryptRecord(vaultKey, dev.id, enc));
-        }
-        setDecryptedAll(plainList);
-        setVisibleCount(PAGE_STEP);
-      } catch (err) {
-        setError(friendlyErrorMessageAr(err));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [vaultKey]
-  );
-
+  // Real-time encrypted records subscription + client-side AES-256-GCM decryption
   useEffect(() => {
-    if (selectedDevice) {
-      void loadDeviceRecords(selectedDevice);
-    } else {
+    if (!selectedDevice) {
       setDecryptedAll([]);
+      return;
     }
-  }, [selectedDevice, loadDeviceRecords]);
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    const unsub = CloudRepo.subscribeDeviceRecords(
+      selectedDevice.id,
+      (encList) => {
+        void (async () => {
+          try {
+            const plainList: PlainRecord[] = [];
+            for (const enc of encList) {
+              plainList.push(await decryptRecord(vaultKey, selectedDevice.id, enc));
+            }
+            if (!cancelled) {
+              setDecryptedAll(plainList);
+              setLoading(false);
+            }
+          } catch (err) {
+            if (!cancelled) {
+              setError(friendlyErrorMessageAr(err));
+              setLoading(false);
+            }
+          }
+        })();
+      },
+      (err) => {
+        if (!cancelled) {
+          setError(friendlyErrorMessageAr(err));
+          setLoading(false);
+        }
+      }
+    );
+
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, [selectedDevice?.id, vaultKey]);
 
   useEffect(() => {
     setVisibleCount(PAGE_STEP);
@@ -113,7 +124,6 @@ export const RecordsExplorerView: React.FC<RecordsExplorerViewProps> = ({
     setError(null);
     try {
       await CloudRepo.deleteRecord(selectedDevice.id, recordToDelete.id);
-      setDecryptedAll((prev) => prev.filter((x) => x.id !== recordToDelete.id));
       setRecordToDelete(null);
     } catch (err) {
       setError(friendlyErrorMessageAr(err));
@@ -127,7 +137,7 @@ export const RecordsExplorerView: React.FC<RecordsExplorerViewProps> = ({
       <div className="rounded-xl border border-slate-200 bg-white p-10 text-center">
         <h2 className="text-base font-bold text-slate-900">لا يوجد جهاز محدد للاستعراض</h2>
         <p className="mt-1.5 text-sm text-slate-600">
-          انتقل إلى قسم النسخ والاستيراد لحفظ أول سجل مشفّر في حسابك.
+          انتقل إلى قسم النسخ والاستيراد لحفظ أو استيراد سجلاتك المشفّرة في حسابك.
         </p>
         <button
           type="button"
@@ -184,7 +194,6 @@ export const RecordsExplorerView: React.FC<RecordsExplorerViewProps> = ({
         )}
       </div>
 
-      {/* Interactive Category Tabs + Period Filter + Live Search */}
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex flex-wrap items-center gap-3">
           <div className="inline-flex rounded-lg bg-slate-100 p-1">

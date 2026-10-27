@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Download, FolderOpen, PlusCircle, RefreshCw, Smartphone, Trash2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Download, FolderOpen, PlusCircle, Smartphone, Trash2 } from 'lucide-react';
 import { CloudRepo } from '../core/cloudRepo';
 import { TimeFmt } from '../core/csvAndTime';
 import { friendlyErrorMessageAr } from '../core/firebase';
@@ -40,36 +40,50 @@ export const DevicesView: React.FC<DevicesViewProps> = ({
   } | null>(null);
   const [busyAction, setBusyAction] = useState(false);
 
-  const loadDevicesAndCounts = useCallback(async () => {
+  // Live real-time subscription to registered devices in Cloud Firestore
+  useEffect(() => {
     setLoading(true);
     setError(null);
-    try {
-      const list = await CloudRepo.listDevices();
-      setDevices(list);
+    const unsub = CloudRepo.subscribeDevices(
+      (list) => {
+        setDevices(list);
+        setLoading(false);
+      },
+      (err) => {
+        setError(friendlyErrorMessageAr(err));
+        setLoading(false);
+      }
+    );
+    return () => unsub();
+  }, [refreshSignal]);
 
-      const entries = await Promise.all(
-        list.map(async (dev) => {
-          const recs = await CloudRepo.listDeviceRecords(dev.id);
+  // Live real-time record counts per device
+  useEffect(() => {
+    if (!devices || devices.length === 0) {
+      setCountsMap({});
+      return;
+    }
+    const unsubs = devices.map((dev) =>
+      CloudRepo.subscribeDeviceRecords(
+        dev.id,
+        (recs) => {
           const counts: DeviceCounts = { call: 0, sms: 0, clip: 0, total: recs.length };
           for (const r of recs) {
             if (r.type === RecordType.CALL) counts.call++;
             else if (r.type === RecordType.SMS) counts.sms++;
             else if (r.type === RecordType.CLIP) counts.clip++;
           }
-          return [dev.id, counts] as const;
-        })
-      );
-      setCountsMap(Object.fromEntries(entries));
-    } catch (err) {
-      setError(friendlyErrorMessageAr(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadDevicesAndCounts();
-  }, [loadDevicesAndCounts, refreshSignal]);
+          setCountsMap((prev) => ({ ...prev, [dev.id]: counts }));
+        },
+        (err) => {
+          setError(friendlyErrorMessageAr(err));
+        }
+      )
+    );
+    return () => {
+      unsubs.forEach((u) => u());
+    };
+  }, [devices]);
 
   const handleConfirmDelete = async () => {
     if (!confirmState) return;
@@ -87,7 +101,6 @@ export const DevicesView: React.FC<DevicesViewProps> = ({
         setNotice(`أُزيل الجهاز «${confirmState.device.name}» من الحساب مع بياناته السحابية.`);
       }
       setConfirmState(null);
-      await loadDevicesAndCounts();
     } catch (err) {
       setError(friendlyErrorMessageAr(err));
     } finally {
@@ -103,7 +116,7 @@ export const DevicesView: React.FC<DevicesViewProps> = ({
         <div>
           <h1 className="text-2xl font-bold text-slate-900">الأجهزة والنسخ السحابية</h1>
           <p className="mt-1 text-sm text-slate-600">
-            الأجهزة المسجّلة ضمن حسابك فقط · إجمالي السجلات المشفّرة في السحابة:{' '}
+            مزامنة لحظية مباشرة مع السحابة · إجمالي السجلات المشفّرة المحفوظة:{' '}
             <span className="font-mono font-semibold text-slate-900 tabular-nums">
               {loading ? '…' : totalCloudRecords}
             </span>
@@ -111,15 +124,6 @@ export const DevicesView: React.FC<DevicesViewProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={() => void loadDevicesAndCounts()}
-            disabled={loading}
-            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            <span>تحديث القائمة</span>
-          </button>
           <button
             type="button"
             onClick={onGoToBackupSource}
@@ -161,8 +165,8 @@ export const DevicesView: React.FC<DevicesViewProps> = ({
           <Smartphone className="mx-auto h-8 w-8 text-slate-400" />
           <h2 className="mt-3 text-base font-bold text-slate-900">لا توجد أجهزة مسجّلة بعد</h2>
           <p className="mx-auto mt-1.5 max-w-md text-sm text-slate-600">
-            يمكنك حفظ نصوص الحافظة أو استيراد سجلات المكالمات والرسائل مباشرة من هذا المتصفح، أو
-            تشغيل تطبيق أندرويد بنفس الحساب وعبارة التشفير.
+            استورد ملفات المكالمات والرسائل المصدّرة من هاتفك (`XML` أو `CSV` أو `JSON`) أو احفظ
+            نصوص الحافظة لرفعها مشفّرة إلى حسابك السحابي.
           </p>
           <button
             type="button"

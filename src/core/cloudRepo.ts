@@ -4,10 +4,13 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
+  onSnapshot,
   query,
   serverTimestamp,
   setDoc,
+  Unsubscribe,
   updateDoc,
   where,
   writeBatch,
@@ -53,6 +56,12 @@ function assertValidId(id: string, label: string): void {
   }
 }
 
+export interface LiveCloudCheckResult {
+  latencyMs: number;
+  hasCryptoDoc: boolean;
+  iterations: number | null;
+}
+
 export const CloudRepo = {
   // ---------------- Cryptographic Root (/users/{uid}/meta/crypto) ----------------
 
@@ -62,6 +71,26 @@ export const CloudRepo = {
     try {
       const snap = await getDoc(doc(db, 'users', uid, 'meta', 'crypto'));
       return snap.exists();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, path);
+    }
+  },
+
+  /**
+   * Queries Google Cloud Firestore server directly (bypassing any local cache) to verify live persistence.
+   */
+  async verifyLiveCloudRoundtrip(): Promise<LiveCloudCheckResult> {
+    const uid = requireUid();
+    const path = `users/${uid}/meta/crypto`;
+    const start = performance.now();
+    try {
+      const snap = await getDocFromServer(doc(db, 'users', uid, 'meta', 'crypto'));
+      const latencyMs = Math.max(1, Math.round(performance.now() - start));
+      return {
+        latencyMs,
+        hasCryptoDoc: snap.exists(),
+        iterations: snap.exists() ? Number(snap.data().iter ?? PBKDF2_ITERATIONS) : null,
+      };
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, path);
     }
@@ -219,6 +248,46 @@ export const CloudRepo = {
     }
   },
 
+  subscribeDevices(
+    onData: (devices: DeviceInfo[]) => void,
+    onError: (err: Error) => void
+  ): Unsubscribe {
+    const uid = requireUid();
+    const path = `users/${uid}/devices`;
+    const q = query(collection(db, 'users', uid, 'devices'), where('ownerId', '==', uid));
+    return onSnapshot(
+      q,
+      (snap) => {
+        const list = snap.docs
+          .map((d) => {
+            const raw = d.data();
+            const lastSync = Number(raw.lastSyncAt ?? 0);
+            return {
+              id: d.id,
+              ownerId: String(raw.ownerId ?? uid),
+              name: String(raw.name ?? d.id),
+              model: String(raw.model ?? ''),
+              enabled: Array.isArray(raw.enabled)
+                ? (raw.enabled.filter((x) =>
+                    [RecordType.CALL, RecordType.SMS, RecordType.CLIP].includes(x as RecordType)
+                  ) as RecordType[])
+                : [],
+              lastSyncAt: lastSync > 0 ? lastSync : null,
+            };
+          })
+          .sort((a, b) => (b.lastSyncAt ?? 0) - (a.lastSyncAt ?? 0));
+        onData(list);
+      },
+      (error) => {
+        try {
+          handleFirestoreError(error, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+        }
+      }
+    );
+  },
+
   // ---------------- Records (/users/{uid}/devices/{deviceId}/records/{recId}) ----------------
 
   async listDeviceRecords(deviceId: string): Promise<EncRecord[]> {
@@ -249,6 +318,46 @@ export const CloudRepo = {
     }
   },
 
+  subscribeDeviceRecords(
+    deviceId: string,
+    onData: (records: EncRecord[]) => void,
+    onError: (err: Error) => void
+  ): Unsubscribe {
+    const uid = requireUid();
+    assertValidId(deviceId, 'deviceId');
+    const path = `users/${uid}/devices/${deviceId}/records`;
+    const q = query(
+      collection(db, 'users', uid, 'devices', deviceId, 'records'),
+      where('ownerId', '==', uid)
+    );
+    return onSnapshot(
+      q,
+      (snap) => {
+        const list = snap.docs
+          .map((d) => {
+            const raw = d.data();
+            return {
+              id: d.id,
+              deviceId,
+              type: raw.type as RecordType,
+              ts: Number(raw.ts ?? 0),
+              iv: String(raw.iv ?? ''),
+              data: String(raw.data ?? ''),
+            };
+          })
+          .sort((a, b) => b.ts - a.ts);
+        onData(list);
+      },
+      (error) => {
+        try {
+          handleFirestoreError(error, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+        }
+      }
+    );
+  },
+
   /**
    * Uploads encrypted records in atomic batches (<= 200).
    * Preserves deterministic ID deduplication and respects immutable createdAt on re-uploads.
@@ -263,7 +372,6 @@ export const CloudRepo = {
     assertValidId(deviceId, 'deviceId');
     const basePath = `users/${uid}/devices/${deviceId}/records`;
 
-    // Fetch existing IDs for this device once to choose create vs action-based update cleanly
     const existingIds = new Set<string>();
     try {
       const q = query(
@@ -352,10 +460,6 @@ export const CloudRepo = {
     return allDocs.length;
   },
 
-  /**
-   * Deletes all child records first (while parent device still exists to satisfy Master Gate)
-   * and then deletes the device document itself.
-   */
   async deleteDevice(deviceId: string): Promise<void> {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
@@ -368,10 +472,6 @@ export const CloudRepo = {
     }
   },
 
-  /**
-   * Re-authenticates the user via Google Popup, deletes all cloud devices & encrypted records,
-   * deletes the cryptographic root (meta/crypto), and deletes the Firebase Auth account.
-   */
   async deleteAccountAndVault(): Promise<void> {
     const user = auth.currentUser;
     if (!user) throw new Error('يلزم تسجيل الدخول أولًا.');

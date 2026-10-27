@@ -1,10 +1,5 @@
 import React, { useState } from 'react';
-import firebaseConfig from '../../firebase-applet-config.json';
-import {
-  friendlyErrorMessageAr,
-  isAuthProviderNotEnabledError,
-  SessionBootstrapState,
-} from '../core/firebase';
+import { friendlyErrorMessageAr, SessionBootstrapState } from '../core/firebase';
 import { AuthSessionResult, UsernameAuth } from '../core/usernameAuth';
 
 interface UsernameAuthGateProps {
@@ -21,7 +16,6 @@ export const UsernameAuthGate: React.FC<UsernameAuthGateProps> = ({
   const [password, setPassword] = useState<string>('');
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [providerNotEnabled, setProviderNotEnabled] = useState<boolean>(false);
 
   const isRegister = mode === 'register';
 
@@ -30,7 +24,6 @@ export const UsernameAuthGate: React.FC<UsernameAuthGateProps> = ({
     if (busy) return;
     setBusy(true);
     setError(null);
-    setProviderNotEnabled(false);
 
     try {
       const session = isRegister
@@ -38,9 +31,6 @@ export const UsernameAuthGate: React.FC<UsernameAuthGateProps> = ({
         : await UsernameAuth.login(username, password);
       onAuthenticated(session);
     } catch (err) {
-      if (isAuthProviderNotEnabledError(err)) {
-        setProviderNotEnabled(true);
-      }
       setError(friendlyErrorMessageAr(err));
     } finally {
       setBusy(false);
@@ -52,7 +42,6 @@ export const UsernameAuthGate: React.FC<UsernameAuthGateProps> = ({
     setMode((prev) => (prev === 'login' ? 'register' : 'login'));
     setPassword('');
     setError(null);
-    setProviderNotEnabled(false);
   };
 
   return (
@@ -118,17 +107,7 @@ export const UsernameAuthGate: React.FC<UsernameAuthGateProps> = ({
               role="alert"
               className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm leading-relaxed text-red-700"
             >
-              <div>{error}</div>
-              {providerNotEnabled && (
-                <a
-                  href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/providers`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-2 inline-block text-xs font-semibold text-red-900 underline hover:text-red-700"
-                >
-                  فتح إعدادات المصادقة في Firebase لتفعيل Email/Password
-                </a>
-              )}
+              {error}
             </div>
           )}
 

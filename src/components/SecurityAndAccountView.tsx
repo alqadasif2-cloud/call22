@@ -1,5 +1,4 @@
 import React, { useEffect, useState } from 'react';
-import { User } from 'firebase/auth';
 import {
   CheckCircle2,
   LogOut,
@@ -15,12 +14,12 @@ import { CloudRepo, LiveCloudCheckResult } from '../core/cloudRepo';
 import { KeyVault, PBKDF2_ITERATIONS } from '../core/crypto';
 import { friendlyErrorMessageAr } from '../core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore, LocalQueueDb } from '../core/localQueue';
+import { AccountSession } from '../core/types';
 import { UsernameAuth } from '../core/usernameAuth';
 import { ConfirmModal } from './Dialogs';
 
 interface SecurityAndAccountViewProps {
-  user: User;
-  username: string;
+  session: AccountSession;
   prefs: LocalDevicePrefs;
   onCloudChanged: () => void;
 }
@@ -28,15 +27,14 @@ interface SecurityAndAccountViewProps {
 type ConfirmKind = 'cloud' | 'local' | 'device' | 'account' | null;
 
 export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
-  user,
-  username,
+  session,
   prefs,
   onCloudChanged,
 }) => {
   const [confirmKind, setConfirmKind] = useState<ConfirmKind>(null);
   const [accountPassword, setAccountPassword] = useState('');
   const [resolvedUsername, setResolvedUsername] = useState<string>(
-    username || UsernameAuth.getSavedUsername() || user.displayName || ''
+    session.username || UsernameAuth.getSavedUsername() || ''
   );
   const [busy, setBusy] = useState(false);
   const [checkingServer, setCheckingServer] = useState(false);
@@ -48,7 +46,7 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
     let cancelled = false;
     void (async () => {
       try {
-        const fetched = await CloudRepo.getCurrentUsername();
+        const fetched = await CloudRepo.getCurrentUsername(session.uid);
         if (!cancelled && fetched) {
           setResolvedUsername(fetched);
           UsernameAuth.saveUsername(fetched);
@@ -60,7 +58,7 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [user.uid]);
+  }, [session.uid]);
 
   const handleVerifyLiveServer = async () => {
     setCheckingServer(true);
@@ -80,7 +78,7 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
     setNotice(null);
     setError(null);
     try {
-      const count = await LocalQueueDb.resetAllToPending(user.uid);
+      const count = await LocalQueueDb.resetAllToPending(session.uid);
       setNotice(
         `أُعيدت ${count} سجلات محلية إلى قائمة الرفع. انتقل إلى «النسخ والاستيراد» واضغط «المزامنة الآن» لإعادة رفعها.`
       );
@@ -112,7 +110,7 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
           break;
         }
         case 'local': {
-          await LocalQueueDb.deleteAllForUser(user.uid);
+          await LocalQueueDb.deleteAllForUser(session.uid);
           setNotice('حُذفت السجلات المحلية من هذا المتصفح فقط، والنسخة السحابية باقية كما هي.');
           break;
         }
@@ -126,9 +124,10 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
             accountPassword,
             UsernameAuth.deleteCustomAuthAccountIfConfigured
           );
-          await LocalQueueDb.deleteAllForUser(user.uid);
-          LocalPrefsStore.clear(user.uid);
-          await KeyVault.clear(user.uid);
+          await LocalQueueDb.deleteAllForUser(session.uid);
+          LocalPrefsStore.clear(session.uid);
+          await KeyVault.clear(session.uid);
+          await UsernameAuth.signOut();
           setAccountPassword('');
           return;
         }
@@ -215,8 +214,8 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
             </div>
             <div className="flex items-center justify-between py-2.5">
               <span className="text-slate-600">معرّف الحساب الفريد (UID)</span>
-              <span dir="ltr" className="font-mono text-xs text-slate-900">
-                {user.uid}
+              <span dir="ltr" className="font-mono text-xs text-slate-900 break-all">
+                {session.uid}
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">

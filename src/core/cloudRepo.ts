@@ -26,7 +26,7 @@ import {
   randomBytes,
   unb64,
 } from './crypto';
-import { auth, db, handleFirestoreError } from './firebase';
+import { ActiveSessionStore, auth, db, handleFirestoreError } from './firebase';
 import { DeviceInfo, EncRecord, NormalizedUsername, OperationType, RecordType } from './types';
 
 /**
@@ -45,8 +45,8 @@ export const BLUEPRINT_LIMITS = {
   ALLOWED_TYPES: [RecordType.CALL, RecordType.SMS, RecordType.CLIP] as const,
 };
 
-function requireUid(): string {
-  const uid = auth.currentUser?.uid;
+function requireUid(explicitUid?: string): string {
+  const uid = explicitUid || ActiveSessionStore.getActiveUid();
   if (!uid || !BLUEPRINT_LIMITS.ID_PATTERN.test(uid) || uid.length > BLUEPRINT_LIMITS.ID_MAX_LEN) {
     throw new Error('يلزم تسجيل الدخول أولًا.');
   }
@@ -68,15 +68,98 @@ export interface LiveCloudCheckResult {
 export const CloudRepo = {
   // ---------------- Account Profile & Username Claim (/users/{uid} & /usernames/{usernameId}) ----------------
 
-  async getCurrentUsername(): Promise<string | null> {
-    const uid = requireUid();
+  /**
+   * Atomically claims `/usernames/{usernameId}`, creates `/users/{uid}`, and initializes
+   * `/users/{uid}/meta/crypto` in a single Firestore batch for PBKDF2 capability accounts.
+   * Rejects duplicate usernames atomically (`allow update: if false` on `/usernames/{usernameId}`).
+   */
+  async registerCapabilityAccount(
+    uid: string,
+    norm: NormalizedUsername,
+    passphrase: string
+  ): Promise<CryptoKey> {
+    assertValidId(uid, 'uid');
+    const salt = randomBytes(16);
+    const key = await deriveVaultKey(passphrase, salt, PBKDF2_ITERATIONS);
+    const box = await encryptBox(key, CHECK_PLAIN, CHECK_AAD);
+
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'usernames', norm.usernameId), {
+      uid,
+      usernameLower: norm.usernameLower,
+      createdAt: serverTimestamp(),
+    });
+    batch.set(doc(db, 'users', uid), {
+      uid,
+      username: norm.username,
+      usernameLower: norm.usernameLower,
+      usernameId: norm.usernameId,
+      createdAt: serverTimestamp(),
+    });
+    batch.set(doc(db, 'users', uid, 'meta', 'crypto'), {
+      uid,
+      salt: b64(salt),
+      iter: PBKDF2_ITERATIONS,
+      checkIv: b64(box.iv),
+      check: b64(box.data),
+      v: 1,
+      createdAt: serverTimestamp(),
+    });
+
+    try {
+      await batch.commit();
+      return key;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (
+        msg.includes('Missing or insufficient permissions') ||
+        msg.includes('permission-denied') ||
+        msg.includes('already-exists')
+      ) {
+        throw new Error('اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر.');
+      }
+      handleFirestoreError(error, OperationType.CREATE, `usernames/${norm.usernameId}`);
+    }
+  },
+
+  /**
+   * Verifies that `/users/{uid}` exists on Firestore for the derived capability UID and returns
+   * its stored display username, or `null` if the username/password combination does not match.
+   */
+  async lookupCapabilityAccountUsername(uid: string): Promise<string | null> {
+    assertValidId(uid, 'uid');
+    const path = `users/${uid}`;
+    try {
+      let snap;
+      try {
+        snap = await getDocFromServer(doc(db, 'users', uid));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('offline') || msg.includes('unavailable')) {
+          snap = await getDoc(doc(db, 'users', uid));
+        } else {
+          throw err;
+        }
+      }
+      if (!snap.exists()) return null;
+      const storedUsername = snap.data().username;
+      return typeof storedUsername === 'string' && storedUsername.length >= 3
+        ? storedUsername
+        : null;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, path);
+    }
+  },
+
+  async getCurrentUsername(explicitUid?: string): Promise<string | null> {
+    const uid = requireUid(explicitUid);
     const path = `users/${uid}`;
     try {
       const snap = await getDoc(doc(db, 'users', uid));
       if (snap.exists() && typeof snap.data().username === 'string') {
         return snap.data().username as string;
       }
-      return auth.currentUser?.displayName || null;
+      return ActiveSessionStore.load()?.username || auth.currentUser?.displayName || null;
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, path);
     }
@@ -142,8 +225,8 @@ export const CloudRepo = {
 
   // ---------------- Cryptographic Root (/users/{uid}/meta/crypto) ----------------
 
-  async hasCrypto(): Promise<boolean> {
-    const uid = requireUid();
+  async hasCrypto(explicitUid?: string): Promise<boolean> {
+    const uid = requireUid(explicitUid);
     const path = `users/${uid}/meta/crypto`;
     try {
       const snap = await getDoc(doc(db, 'users', uid, 'meta', 'crypto'));
@@ -173,8 +256,8 @@ export const CloudRepo = {
     }
   },
 
-  async createCrypto(passphrase: string): Promise<CryptoKey> {
-    const uid = requireUid();
+  async createCrypto(passphrase: string, explicitUid?: string): Promise<CryptoKey> {
+    const uid = requireUid(explicitUid);
     const salt = randomBytes(16);
     const key = await deriveVaultKey(passphrase, salt, PBKDF2_ITERATIONS);
     const box = await encryptBox(key, CHECK_PLAIN, CHECK_AAD);
@@ -198,8 +281,8 @@ export const CloudRepo = {
     }
   },
 
-  async unlock(passphrase: string): Promise<CryptoKey | null> {
-    const uid = requireUid();
+  async unlock(passphrase: string, explicitUid?: string): Promise<CryptoKey | null> {
+    const uid = requireUid(explicitUid);
     const path = `users/${uid}/meta/crypto`;
     let snap;
     try {
@@ -233,9 +316,10 @@ export const CloudRepo = {
     deviceId: string,
     name: string,
     model: string,
-    enabled: RecordType[]
+    enabled: RecordType[],
+    explicitUid?: string
   ): Promise<void> {
-    const uid = requireUid();
+    const uid = requireUid(explicitUid);
     assertValidId(deviceId, 'deviceId');
 
     const safeName = (name.trim() || 'جهاز بدون اسم').slice(0, BLUEPRINT_LIMITS.DEVICE_NAME_MAX_LEN);
@@ -436,7 +520,7 @@ export const CloudRepo = {
   },
 
   /**
-   * Uploads encrypted records in atomic batches (<= 200).
+   * Uploads encrypted records in atomic batches (<= 400).
    * Preserves deterministic ID deduplication and respects immutable createdAt on re-uploads.
    */
   async uploadBatch(deviceId: string, records: EncRecord[]): Promise<void> {
@@ -553,17 +637,16 @@ export const CloudRepo = {
     password: string,
     customDeleteFn?: (pw: string) => Promise<boolean>
   ): Promise<void> {
-    const user = auth.currentUser;
-    if (!user) throw new Error('يلزم تسجيل الدخول أولًا.');
+    const uid = requireUid();
+    const fbUser = auth.currentUser;
     const trimmed = password.trim();
     if (!trimmed) throw new Error('يرجى إدخال كلمة المرور لتأكيد حذف الحساب.');
-    const uid = user.uid;
 
-    if (user.email && user.providerData.some((p) => p.providerId === 'password')) {
-      const cred = EmailAuthProvider.credential(user.email, trimmed);
-      await reauthenticateWithCredential(user, cred);
-    } else if (await CloudRepo.hasCrypto()) {
-      const verified = await CloudRepo.unlock(trimmed);
+    if (fbUser && fbUser.email && fbUser.providerData.some((p) => p.providerId === 'password')) {
+      const cred = EmailAuthProvider.credential(fbUser.email, trimmed);
+      await reauthenticateWithCredential(fbUser, cred);
+    } else if (await CloudRepo.hasCrypto(uid)) {
+      const verified = await CloudRepo.unlock(trimmed, uid);
       if (!verified) {
         throw new Error('كلمة المرور غير صحيحة.');
       }
@@ -591,21 +674,21 @@ export const CloudRepo = {
       handleFirestoreError(error, OperationType.DELETE, cryptoPath);
     }
 
-    const deletedByCustomFn = customDeleteFn ? await customDeleteFn(trimmed) : false;
+    const deletedByCustomFn = fbUser && customDeleteFn ? await customDeleteFn(trimmed) : false;
     if (!deletedByCustomFn) {
+      const finalBatch = writeBatch(db);
+      finalBatch.delete(doc(db, 'users', uid));
       if (claimedUsernameId) {
-        try {
-          await deleteDoc(doc(db, 'usernames', claimedUsernameId));
-        } catch {
-          // Best-effort release
-        }
+        finalBatch.delete(doc(db, 'usernames', claimedUsernameId));
       }
       try {
-        await deleteDoc(doc(db, 'users', uid));
-      } catch {
-        // Best-effort profile cleanup
+        await finalBatch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, `users/${uid}`);
       }
-      await deleteUser(user);
+      if (fbUser) {
+        await deleteUser(fbUser);
+      }
     }
   },
 };

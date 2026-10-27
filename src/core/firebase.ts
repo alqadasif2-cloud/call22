@@ -3,7 +3,7 @@ import { getAuth, signOut } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { getPrebootSessionState, SessionBootstrapState } from './prebootAuthGuard';
-import { FirestoreErrorInfo, OperationType } from './types';
+import { AccountSession, FirestoreErrorInfo, OperationType } from './types';
 
 export type { SessionBootstrapState };
 
@@ -11,20 +11,80 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 
+const ACTIVE_SESSION_KEY = 'personal_backup_active_session_v2';
+type SessionListener = (session: AccountSession | null) => void;
+const sessionListeners = new Set<SessionListener>();
+let memoryActiveSession: AccountSession | null = null;
+
+function readStoredSession(): AccountSession | null {
+  if (memoryActiveSession) return memoryActiveSession;
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(ACTIVE_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AccountSession>;
+    if (
+      typeof parsed.uid === 'string' &&
+      parsed.uid.length >= 1 &&
+      parsed.uid.length <= 128 &&
+      typeof parsed.username === 'string' &&
+      parsed.username.length >= 3
+    ) {
+      memoryActiveSession = { uid: parsed.uid, username: parsed.username };
+      return memoryActiveSession;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export const ActiveSessionStore = {
+  load(): AccountSession | null {
+    return readStoredSession();
+  },
+
+  getActiveUid(): string | null {
+    return auth.currentUser?.uid || readStoredSession()?.uid || null;
+  },
+
+  save(session: AccountSession): void {
+    memoryActiveSession = session;
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify(session));
+      } catch {
+        // Ignore storage quota errors
+      }
+    }
+    sessionListeners.forEach((cb) => cb(session));
+  },
+
+  clear(): void {
+    memoryActiveSession = null;
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.removeItem(ACTIVE_SESSION_KEY);
+      } catch {
+        // Ignore
+      }
+    }
+    sessionListeners.forEach((cb) => cb(null));
+  },
+
+  subscribe(listener: SessionListener): () => void {
+    sessionListeners.add(listener);
+    return () => {
+      sessionListeners.delete(listener);
+    };
+  },
+};
+
 export function isTokenServiceDisabledError(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return (
     msg.includes('token-service-api-has-not-been-used') ||
     msg.includes('securetoken.googleapis.com')
-  );
-}
-
-export function isAuthProviderNotEnabledError(err: unknown): boolean {
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return (
-    msg.includes('auth/operation-not-allowed') ||
-    msg.includes('admin_only_operation') ||
-    msg.includes('operation_not_allowed')
   );
 }
 
@@ -49,7 +109,7 @@ export function bootstrapFirebaseSession(): Promise<SessionBootstrapState> {
       const initial = getPrebootSessionState();
       let sessionExpiredReset = initial.sessionExpiredReset;
       let tokenServiceDisabled = initial.tokenServiceDisabled;
-      let activationUrl = initial.activationUrl;
+      const activationUrl = initial.activationUrl;
 
       try {
         await auth.authStateReady();
@@ -57,11 +117,11 @@ export function bootstrapFirebaseSession(): Promise<SessionBootstrapState> {
           try {
             await auth.currentUser.getIdToken(false);
           } catch (tokenErr) {
-            sessionExpiredReset = true;
+            if (!ActiveSessionStore.load()) {
+              sessionExpiredReset = true;
+            }
             if (isTokenServiceDisabledError(tokenErr)) {
               tokenServiceDisabled = true;
-              const projNum = firebaseConfig.messagingSenderId || firebaseConfig.projectId;
-              activationUrl = `https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=${projNum}`;
             }
             await signOut(auth);
           }
@@ -93,7 +153,7 @@ export function handleFirestoreError(
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid,
+      userId: ActiveSessionStore.getActiveUid(),
       email: auth.currentUser?.email,
       emailVerified: auth.currentUser?.emailVerified,
       isAnonymous: auth.currentUser?.isAnonymous,
@@ -116,10 +176,6 @@ export function handleFirestoreError(
  */
 export function friendlyErrorMessageAr(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
-
-  if (isAuthProviderNotEnabledError(err)) {
-    return 'طريقة المصادقة بكلمة المرور غير مفعّلة بعد في مشروع Firebase. فعّل خيار Email/Password من لوحة تحكم Firebase (Authentication ← Sign-in method) ثم أعد المحاولة.';
-  }
 
   if (isTokenServiceDisabledError(err)) {
     return 'انتهت صلاحية الجلسة السابقة. يرجى تسجيل الدخول باسم المستخدم وكلمة المرور للمتابعة.';

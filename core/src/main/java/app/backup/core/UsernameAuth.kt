@@ -2,11 +2,11 @@ package app.backup.core
 
 import android.content.Context
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.auth.UserProfileChangeRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -28,14 +28,15 @@ object UsernameAuth {
     private const val LOCKOUT_MS = 15 * 60 * 1000L
     private const val MAX_ATTEMPTS = 5
 
+    private enum class CustomFnState { UNKNOWN, DEPLOYED, NOT_DEPLOYED }
+
+    @Volatile
+    private var customFnState: CustomFnState = CustomFnState.UNKNOWN
+
     /** يمنع تعارض مستمع الجلسة في AuthGate أثناء اشتقاق مفتاح التشفير عند التسجيل أو الدخول. */
     @Volatile
     var inProgress: Boolean = false
         private set
-
-    /** رابط وظيفة Cloud Function الاختيارية للمصادقة المخصصة (Custom Authentication). */
-    @Volatile
-    var customAuthEndpoint: String = ""
 
     fun normalizeUsername(raw: String): NormalizedUsername {
         val trimmed = raw.trim()
@@ -89,6 +90,7 @@ object UsernameAuth {
         prefs.edit()
             .putInt("attempts", next)
             .putLong("window_start", nextStart)
+            .putLong("blockedUntil", blockedUntil)
             .putLong("blocked_until", blockedUntil)
             .apply()
     }
@@ -98,6 +100,7 @@ object UsernameAuth {
             .edit()
             .remove("attempts")
             .remove("window_start")
+            .remove("blockedUntil")
             .remove("blocked_until")
             .apply()
     }
@@ -113,23 +116,39 @@ object UsernameAuth {
             .apply()
     }
 
-    private suspend fun callCustomAuthFunction(
-        endpoint: String,
+    /**
+     * يستدعي وظيفة Cloud Function (`authUsername`) تلقائيًا إن كانت منشورة على المشروع؛
+     * وإذا لم تكن منشورة يعيد `null` لينفّذ التطبيق المصادقة السحابية المشفّرة مباشرةً على Firestore
+     * دون الحاجة لأي إعداد في لوحة تحكم Firebase.
+     */
+    private suspend fun tryCallProjectCustomAuth(
         action: String,
         username: String,
         password: String,
         idToken: String? = null,
-    ): JSONObject = withContext(Dispatchers.IO) {
-        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 15_000
-            readTimeout = 20_000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            if (!idToken.isNullOrBlank()) {
-                setRequestProperty("Authorization", "Bearer $idToken")
+    ): JSONObject? = withContext(Dispatchers.IO) {
+        if (customFnState == CustomFnState.NOT_DEPLOYED) return@withContext null
+        val endpoint = CloudInit.projectCustomAuthEndpoint()
+        if (endpoint.isBlank()) return@withContext null
+
+        val conn = try {
+            (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 5_000
+                readTimeout = 10_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                if (!idToken.isNullOrBlank()) {
+                    setRequestProperty("Authorization", "Bearer $idToken")
+                }
             }
+        } catch (_: IOException) {
+            if (customFnState == CustomFnState.DEPLOYED) {
+                throw UsernameAuthException("لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة.")
+            }
+            return@withContext null
         }
+
         try {
             val payload = JSONObject()
                 .put("action", action)
@@ -138,14 +157,34 @@ object UsernameAuth {
                 .toString()
             conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
+            val contentType = conn.contentType.orEmpty().lowercase(Locale.ROOT)
+            if ((code == 404 || code == 403) && !contentType.contains("application/json")) {
+                customFnState = CustomFnState.NOT_DEPLOYED
+                return@withContext null
+            }
+
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val bodyText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            val json = runCatching { JSONObject(bodyText) }.getOrElse { JSONObject() }
+            val json = runCatching { JSONObject(bodyText) }.getOrNull()
+            if (json == null || !json.has("ok")) {
+                if (customFnState != CustomFnState.DEPLOYED) {
+                    customFnState = CustomFnState.NOT_DEPLOYED
+                    return@withContext null
+                }
+                throw UsernameAuthException("تعذّرت المصادقة مع الخادم ($code).")
+            }
+
+            customFnState = CustomFnState.DEPLOYED
             if (code !in 200..299 || !json.optBoolean("ok", false)) {
                 val msg = json.optString("error").ifBlank { "تعذّرت المصادقة مع الخادم ($code)." }
                 throw UsernameAuthException(msg)
             }
             json
+        } catch (_: IOException) {
+            if (customFnState == CustomFnState.DEPLOYED) {
+                throw UsernameAuthException("لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة.")
+            }
+            null
         } finally {
             conn.disconnect()
         }
@@ -165,37 +204,36 @@ object UsernameAuth {
 
         inProgress = true
         try {
-            val endpoint = customAuthEndpoint.trim()
-            if (endpoint.isNotEmpty()) {
-                val res = callCustomAuthFunction(endpoint, "register", norm.username, validPw)
-                auth.signInWithCustomToken(res.getString("customToken")).await()
-            } else {
-                auth.createUserWithEmailAndPassword(norm.syntheticEmail, validPw).await()
-                runCatching {
-                    val req = UserProfileChangeRequest.Builder().setDisplayName(norm.username).build()
-                    auth.currentUser?.updateProfile(req)?.await()
+            val customRes = tryCallProjectCustomAuth("register", norm.username, validPw)
+            val resolvedUid: String
+            val key: ByteArray
+
+            if (customRes != null) {
+                val cred = auth.signInWithCustomToken(customRes.getString("customToken")).await()
+                resolvedUid = cred.user?.uid ?: throw UsernameAuthException("تعذّر إنشاء جلسة الحساب.")
+                val repo = CloudRepo(auth = auth, explicitUid = resolvedUid)
+                repo.ensureUserProfile(norm, isNewRegistration = false)
+                key = if (repo.hasCrypto()) {
+                    repo.unlock(validPw.toCharArray())
+                        ?: throw UsernameAuthException("تعذّر التحقق من مفتاح التشفير للحساب.")
+                } else {
+                    repo.createCrypto(validPw.toCharArray())
                 }
-            }
-
-            val repo = CloudRepo(auth = auth)
-            repo.ensureUserProfile(norm, isNewRegistration = endpoint.isEmpty())
-
-            val key = if (repo.hasCrypto()) {
-                repo.unlock(validPw.toCharArray())
-                    ?: throw UsernameAuthException("تعذّر التحقق من مفتاح التشفير للحساب.")
             } else {
-                repo.createCrypto(validPw.toCharArray())
+                resolvedUid = withContext(Dispatchers.Default) {
+                    Crypto.deriveCapabilityUid(norm.usernameId, validPw)
+                }
+                val repo = CloudRepo(auth = auth, explicitUid = resolvedUid)
+                key = repo.registerCapabilityAccount(norm, validPw.toCharArray())
             }
 
-            KeyVault(appCtx).save(key)
-            Session.key = key
+            KeyVault(appCtx).saveSession(resolvedUid, key)
+            Session.activate(resolvedUid, key)
             saveCurrentUsername(appCtx, norm.username)
             clearClientFailures(appCtx)
             return norm.username
         } catch (e: Exception) {
-            if (e !is UsernameAuthException) {
-                recordClientFailure(appCtx)
-            }
+            recordClientFailure(appCtx)
             throw e
         } finally {
             inProgress = false
@@ -216,37 +254,48 @@ object UsernameAuth {
 
         inProgress = true
         try {
-            val endpoint = customAuthEndpoint.trim()
-            if (endpoint.isNotEmpty()) {
-                val res = callCustomAuthFunction(endpoint, "login", norm.username, validPw)
-                auth.signInWithCustomToken(res.getString("customToken")).await()
-            } else {
-                auth.signInWithEmailAndPassword(norm.syntheticEmail, validPw).await()
-            }
+            val customRes = tryCallProjectCustomAuth("login", norm.username, validPw)
+            val resolvedUid: String
+            val resolvedName: String
+            val key: ByteArray
 
-            val repo = CloudRepo(auth = auth)
-            repo.ensureUserProfile(norm, isNewRegistration = false)
-
-            val key = if (repo.hasCrypto()) {
-                repo.unlock(validPw.toCharArray()) ?: run {
-                    auth.signOut()
-                    recordClientFailure(appCtx)
-                    throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+            if (customRes != null) {
+                val cred = auth.signInWithCustomToken(customRes.getString("customToken")).await()
+                resolvedUid = cred.user?.uid ?: throw UsernameAuthException("تعذّر استعادة جلسة الحساب.")
+                val repo = CloudRepo(auth = auth, explicitUid = resolvedUid)
+                repo.ensureUserProfile(norm, isNewRegistration = false)
+                key = if (repo.hasCrypto()) {
+                    repo.unlock(validPw.toCharArray()) ?: run {
+                        auth.signOut()
+                        throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                    }
+                } else {
+                    repo.createCrypto(validPw.toCharArray())
                 }
+                resolvedName = repo.getCurrentUsername() ?: norm.username
             } else {
-                repo.createCrypto(validPw.toCharArray())
+                resolvedUid = withContext(Dispatchers.Default) {
+                    Crypto.deriveCapabilityUid(norm.usernameId, validPw)
+                }
+                val repo = CloudRepo(auth = auth, explicitUid = resolvedUid)
+                val storedUsername = repo.lookupCapabilityAccountUsername()
+                    ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                resolvedName = storedUsername
+                key = if (repo.hasCrypto()) {
+                    repo.unlock(validPw.toCharArray())
+                        ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                } else {
+                    repo.createCrypto(validPw.toCharArray())
+                }
             }
 
-            KeyVault(appCtx).save(key)
-            Session.key = key
-            val resolvedName = repo.getCurrentUsername() ?: norm.username
+            KeyVault(appCtx).saveSession(resolvedUid, key)
+            Session.activate(resolvedUid, key)
             saveCurrentUsername(appCtx, resolvedName)
             clearClientFailures(appCtx)
             return resolvedName
         } catch (e: Exception) {
-            if (e !is UsernameAuthException) {
-                recordClientFailure(appCtx)
-            }
+            recordClientFailure(appCtx)
             throw e
         } finally {
             inProgress = false
@@ -254,19 +303,21 @@ object UsernameAuth {
     }
 
     suspend fun deleteCustomAuthAccountIfConfigured(password: String, auth: FirebaseAuth): Boolean {
-        val endpoint = customAuthEndpoint.trim()
-        if (endpoint.isEmpty()) return false
-        val user = auth.currentUser ?: throw IllegalStateException("not signed in")
+        val user = auth.currentUser ?: return false
+        if (user.providerData.any { it.providerId == "password" }) {
+            return false
+        }
         val idToken = user.getIdToken(false).await().token
             ?: throw UsernameAuthException("تعذّر التحقق من الجلسة الحالية.")
-        callCustomAuthFunction(endpoint, "deleteAccount", "", password, idToken)
+        val res = tryCallProjectCustomAuth("deleteAccount", "", password, idToken) ?: return false
+        if (!res.optBoolean("ok", false)) return false
         auth.signOut()
         return true
     }
 
     fun signOut(context: Context, auth: FirebaseAuth = FirebaseAuth.getInstance()) {
-        Session.key = null
+        Session.clear()
         KeyVault(context.applicationContext).clear()
-        auth.signOut()
+        runCatching { auth.signOut() }
     }
 }

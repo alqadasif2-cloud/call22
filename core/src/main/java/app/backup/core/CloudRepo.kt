@@ -23,15 +23,25 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 object CloudInit {
-    private const val DEFAULT_PROJECT_ID = "micro-volt-75v9p"
+    internal const val DEFAULT_PROJECT_ID = "micro-volt-75v9p"
     private const val DEFAULT_APP_ID = "1:634918323270:android:9a6d13baf4427401"
     private const val DEFAULT_API_KEY = "AIzaSyBIcm5I9VXMrAgdrsSbKbLA_9dYMRCWn7Q"
     private const val DEFAULT_SENDER_ID = "634918323270"
     private const val DEFAULT_STORAGE_BUCKET = "micro-volt-75v9p.firebasestorage.app"
+    private const val CLOUD_FUNCTION_REGION = "us-central1"
     const val PROVISIONED_DB_ID = "ai-studio-9b45ca49-21a0-4eb7-af13-f761f2dd91e9"
 
     @Volatile
     var databaseId: String = PROVISIONED_DB_ID
+
+    fun projectCustomAuthEndpoint(): String {
+        val projectId = runCatching { FirebaseApp.getInstance().options.projectId }
+            .getOrNull()
+            ?.trim()
+            .orEmpty()
+            .ifEmpty { DEFAULT_PROJECT_ID }
+        return "https://$CLOUD_FUNCTION_REGION-$projectId.cloudfunctions.net/authUsername"
+    }
 
     fun firestore(): FirebaseFirestore {
         val app = FirebaseApp.getInstance()
@@ -39,9 +49,9 @@ object CloudInit {
             databaseId.isNotBlank() &&
             databaseId != "(default)"
         return if (useNamedDb) {
-            FirebaseFirestore.getInstance(databaseId)
+            FirebaseFirestore.getInstance(app, databaseId)
         } else {
-            FirebaseFirestore.getInstance()
+            FirebaseFirestore.getInstance(app)
         }
     }
 
@@ -79,11 +89,13 @@ object AuthMessages {
             e is FirebaseAuthRecentLoginRequiredException ->
                 "يلزم تسجيل دخول حديث. سجّل الخروج ثم الدخول وأعد المحاولة."
             e is FirebaseNetworkException -> "لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة."
-            raw.contains("ADMIN_ONLY_OPERATION", ignoreCase = true) ||
-                raw.contains("OPERATION_NOT_ALLOWED", ignoreCase = true) ->
-                "يرجى تفعيل طريقة الدخول Email/Password في لوحة تحكم Firebase (Authentication ← Sign-in method) لهذا المشروع."
+            e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAVAILABLE ->
+                "لا يوجد اتصال بالإنترنت حاليًا. تحقق من الشبكة وأعد المحاولة."
+            e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ->
+                "رفضت قواعد الأمان السحابية هذه العملية. تأكد من صلاحية الجلسة وأن البيانات تتبع لحسابك."
             e is FirebaseFirestoreException -> "تعذّرت العملية السحابية (${e.code.name})"
-            else -> "تعذّر إتمام العملية (${e.javaClass.simpleName})"
+            raw.isNotBlank() && raw.any { it in '\u0600'..'\u06FF' } -> raw
+            else -> "تعذّر إتمام العملية السحابية. تحقق من الاتصال وأعد المحاولة."
         }
     }
 }
@@ -93,13 +105,82 @@ data class PageResult(val items: List<EncRecord>, val cursor: DocumentSnapshot?,
 class CloudRepo(
     private val db: FirebaseFirestore = CloudInit.firestore(),
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
+    private val explicitUid: String? = null,
 ) {
-    private val uid: String get() = auth.currentUser?.uid ?: throw IllegalStateException("not signed in")
+    private val uid: String
+        get() = explicitUid
+            ?: Session.uid
+            ?: auth.currentUser?.uid
+            ?: throw IllegalStateException("not signed in")
+
     private fun user() = db.collection("users").document(uid)
     private fun usernameDoc(usernameId: String) = db.collection("usernames").document(usernameId)
     private fun cryptoDoc() = user().collection("meta").document("crypto")
     private fun devices() = user().collection("devices")
     private fun records(deviceId: String) = devices().document(deviceId).collection("records")
+
+    // ---------- تسجيل حساب سحابي ذري ومنع تكرار اسم المستخدم ----------
+    suspend fun registerCapabilityAccount(norm: NormalizedUsername, pass: CharArray): ByteArray {
+        val salt = Crypto.randomBytes(16)
+        val key = withContext(Dispatchers.Default) { Crypto.deriveKey(pass, salt) }
+        val box = Crypto.encrypt(key, CHECK_PLAIN, CHECK_AAD)
+
+        val b = db.batch()
+        b.set(
+            usernameDoc(norm.usernameId),
+            mapOf(
+                "uid" to uid,
+                "usernameLower" to norm.usernameLower,
+                "createdAt" to FieldValue.serverTimestamp(),
+            )
+        )
+        b.set(
+            user(),
+            mapOf(
+                "uid" to uid,
+                "username" to norm.username,
+                "usernameLower" to norm.usernameLower,
+                "usernameId" to norm.usernameId,
+                "createdAt" to FieldValue.serverTimestamp(),
+            )
+        )
+        b.set(
+            cryptoDoc(),
+            mapOf(
+                "uid" to uid,
+                "salt" to Crypto.b64(salt),
+                "iter" to Crypto.ITERATIONS,
+                "checkIv" to Crypto.b64(box.iv),
+                "check" to Crypto.b64(box.data),
+                "v" to 1,
+                "createdAt" to FieldValue.serverTimestamp(),
+            )
+        )
+
+        try {
+            b.commit().await()
+            return key
+        } catch (e: FirebaseFirestoreException) {
+            key.fill(0)
+            if (
+                e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+                e.code == FirebaseFirestoreException.Code.ALREADY_EXISTS
+            ) {
+                throw UsernameAuthException("اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر.")
+            }
+            throw e
+        } catch (e: Exception) {
+            key.fill(0)
+            throw e
+        }
+    }
+
+    /** يتحقق من وجود ملف الحساب السحابي على Firestore ويعيد اسم المستخدم المحفوظ أو null إذا لم يطابق. */
+    suspend fun lookupCapabilityAccountUsername(): String? {
+        val snap = user().get().await()
+        if (!snap.exists()) return null
+        return snap.getString("username")?.takeIf { it.length >= 3 }
+    }
 
     // ---------- ملف الحساب واسم المستخدم ----------
     suspend fun getCurrentUsername(): String? {
@@ -185,8 +266,12 @@ class CloudRepo(
                 Crypto.unb64(d.getString("check")!!),
                 CHECK_AAD,
             )
-            if (plain.contentEquals(CHECK_PLAIN)) key else null
-        } catch (e: Exception) {
+            if (plain.contentEquals(CHECK_PLAIN)) key else {
+                key.fill(0)
+                null
+            }
+        } catch (_: Exception) {
+            key.fill(0)
             null
         }
     }
@@ -345,14 +430,14 @@ class CloudRepo(
         devices().document(deviceId).delete().await()
     }
 
-    /** يتحقق من كلمة المرور، يحذف كل بيانات السحابة، ثم يحذف الحساب نفسه. */
+    /** يتحقق من كلمة المرور، يحذف كل بيانات السحابة، ثم يحذف الحساب وسجل الاسم ذريًا. */
     suspend fun deleteAccount(password: String) {
-        val u = auth.currentUser ?: throw IllegalStateException("not signed in")
         val trimmed = password.trim()
         if (trimmed.isEmpty()) throw UsernameAuthException("يرجى إدخال كلمة المرور لتأكيد الحذف.")
+        val fbUser = auth.currentUser
 
-        if (u.email != null && u.providerData.any { it.providerId == "password" }) {
-            u.reauthenticate(EmailAuthProvider.getCredential(u.email!!, trimmed)).await()
+        if (fbUser != null && fbUser.email != null && fbUser.providerData.any { it.providerId == "password" }) {
+            fbUser.reauthenticate(EmailAuthProvider.getCredential(fbUser.email!!, trimmed)).await()
         } else if (hasCrypto()) {
             val verifiedKey = unlock(trimmed.toCharArray())
                 ?: throw UsernameAuthException("كلمة المرور غير صحيحة.")
@@ -365,15 +450,21 @@ class CloudRepo(
         listDevices().forEach { deleteDevice(it.id) }
         runCatching { cryptoDoc().delete().await() }
 
-        val deletedViaCustomFn = UsernameAuth.deleteCustomAuthAccountIfConfigured(trimmed, auth)
-        if (!deletedViaCustomFn) {
-            if (!claimedUsernameId.isNullOrBlank()) {
-                runCatching { usernameDoc(claimedUsernameId).delete().await() }
-            }
-            runCatching { user().delete().await() }
-            u.delete().await()
+        val deletedViaCustomFn = if (fbUser != null) {
+            UsernameAuth.deleteCustomAuthAccountIfConfigured(trimmed, auth)
+        } else {
+            false
         }
-        Session.key = null
+        if (!deletedViaCustomFn) {
+            val finalBatch = db.batch()
+            finalBatch.delete(user())
+            if (!claimedUsernameId.isNullOrBlank()) {
+                finalBatch.delete(usernameDoc(claimedUsernameId))
+            }
+            finalBatch.commit().await()
+            fbUser?.delete()?.await()
+        }
+        Session.clear()
     }
 
     private companion object {

@@ -16,13 +16,11 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import app.backup.core.CloudRepo
-import app.backup.core.KeyVault
 import app.backup.core.Net
 import app.backup.core.PlainRecord
 import app.backup.core.RecordCodec
 import app.backup.core.RecordType
 import app.backup.core.Session
-import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
@@ -91,10 +89,9 @@ object Engine {
 
     /** المراحل 5-6: رفع على دفعات، ولا يُعلَّم أي سجل «مرفوعًا» إلا بعد تأكيد الخادم للدفعة. */
     suspend fun upload(ctx: Context, dao: RecordDao): SyncResult {
-        if (FirebaseAuth.getInstance().currentUser == null) return SyncResult.NeedsLogin
-        val key = Session.key ?: KeyVault(ctx).load()?.also { Session.key = it } ?: return SyncResult.NeedsLogin
+        val (activeUid, key) = Session.ensureLoaded(ctx) ?: return SyncResult.NeedsLogin
         if (!Net.isOnline(ctx)) return SyncResult.Offline
-        val repo = CloudRepo()
+        val repo = CloudRepo(explicitUid = activeUid)
         val deviceId = Prefs.deviceId
         return try {
             repo.registerDevice(deviceId, Prefs.deviceName.value, Build.MODEL, Prefs.enabled.value.toList())

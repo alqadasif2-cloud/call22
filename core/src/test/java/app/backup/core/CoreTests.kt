@@ -118,6 +118,14 @@ class UsernameAuthTest {
         assertEquals(a.usernameId, b.usernameId)
         assertEquals(a.syntheticEmail, b.syntheticEmail)
         assertEquals("MyBackup2026!", UsernameAuth.validatePassword("MyBackup2026!"))
+
+        val uidBackupApp = Crypto.deriveCapabilityUid(a.usernameId, "MyBackup2026!", iterations = 2000)
+        val uidViewerApp = Crypto.deriveCapabilityUid(b.usernameId, "MyBackup2026!", iterations = 2000)
+        val uidWrongPw = Crypto.deriveCapabilityUid(a.usernameId, "WrongPass2026!", iterations = 2000)
+        assertEquals(50, uidBackupApp.length)
+        assertTrue(uidBackupApp.startsWith("v_"))
+        assertEquals(uidBackupApp, uidViewerApp)
+        assertNotEquals(uidBackupApp, uidWrongPw)
     }
 
     @Test fun rejectsInvalidUsernamesAndShortPasswords() {
@@ -126,4 +134,5 @@ class UsernameAuthTest {
         try { UsernameAuth.validatePassword("1234567"); fail() } catch (_: UsernameAuthException) {}
     }
 }
+
 

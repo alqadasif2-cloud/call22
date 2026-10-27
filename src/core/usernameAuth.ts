@@ -1,22 +1,17 @@
-import {
-  createUserWithEmailAndPassword,
-  signInWithCustomToken,
-  signInWithEmailAndPassword,
-  signOut as firebaseSignOut,
-  updateProfile,
-  User,
-} from 'firebase/auth';
+import { signInWithCustomToken, signOut as firebaseSignOut } from 'firebase/auth';
+import firebaseConfig from '../../firebase-applet-config.json';
 import { BLUEPRINT_LIMITS, CloudRepo } from './cloudRepo';
-import { KeyVault } from './crypto';
-import { auth } from './firebase';
+import { deriveCapabilityUid, KeyVault, sha256Hex } from './crypto';
+import { ActiveSessionStore, auth } from './firebase';
 import { LocalDevicePrefs, LocalPrefsStore } from './localQueue';
-import { NormalizedUsername } from './types';
+import { AccountSession, NormalizedUsername } from './types';
 
 const RATE_LIMIT_KEY = 'personal_backup_auth_rate_limit_v1';
 const LAST_USERNAME_KEY = 'personal_backup_last_username_v1';
 const RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const CLOUD_FUNCTION_REGION = 'us-central1';
 
 interface ClientRateState {
   attempts: number;
@@ -25,21 +20,16 @@ interface ClientRateState {
 }
 
 export interface AuthSessionResult {
-  user: User;
+  session: AccountSession;
   vaultKey: CryptoKey;
   prefs: LocalDevicePrefs;
-  username: string;
 }
 
-async function sha256Hex(text: string): Promise<string> {
-  const bytes = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+type CustomFunctionAvailability = 'unknown' | 'deployed' | 'not_deployed';
+let customFunctionState: CustomFunctionAvailability = 'unknown';
 
 function readRateState(): ClientRateState | null {
+  if (typeof localStorage === 'undefined') return null;
   try {
     const raw = localStorage.getItem(RATE_LIMIT_KEY);
     if (!raw) return null;
@@ -60,6 +50,7 @@ function checkClientRateLimit(nowMs = Date.now()): void {
 }
 
 function recordClientFailure(nowMs = Date.now()): void {
+  if (typeof localStorage === 'undefined') return;
   try {
     const prev = readRateState();
     const expired = !prev || nowMs - prev.windowStartMs > RATE_WINDOW_MS;
@@ -76,6 +67,7 @@ function recordClientFailure(nowMs = Date.now()): void {
 }
 
 function clearClientFailures(): void {
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.removeItem(RATE_LIMIT_KEY);
   } catch {
@@ -83,28 +75,80 @@ function clearClientFailures(): void {
   }
 }
 
-function getCustomAuthEndpoint(): string {
-  const envUrl = import.meta.env.VITE_CUSTOM_AUTH_URL;
-  return typeof envUrl === 'string' ? envUrl.trim() : '';
+/**
+ * Automatically derives the project's Cloud Function HTTPS endpoint directly from
+ * `firebase-applet-config.json` without asking the user for any manual URL or key.
+ */
+export function resolveProjectCustomAuthEndpoint(): string {
+  const projectId = String(firebaseConfig.projectId || '').trim();
+  if (!projectId || projectId === 'remixed-project-id') {
+    return '';
+  }
+  return `https://${CLOUD_FUNCTION_REGION}-${projectId}.cloudfunctions.net/authUsername`;
 }
 
-async function invokeCustomAuthEndpoint(
-  endpoint: string,
+/**
+ * Invokes the project's `authUsername` Cloud Function if deployed on `firebaseConfig.projectId`.
+ * Returns `null` when the Cloud Function is not deployed so the client seamlessly executes
+ * Direct Cloud Capability Authentication against Firestore without requiring Firebase Console setup.
+ */
+async function tryInvokeProjectCustomAuth(
   payload: Record<string, string>,
   idToken?: string
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
+  if (customFunctionState === 'not_deployed') {
+    return null;
+  }
+
+  const endpoint = resolveProjectCustomAuthEndpoint();
+  if (!endpoint) {
+    return null;
+  }
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
   };
   if (idToken) {
     headers.Authorization = `Bearer ${idToken}`;
   }
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
-  const json = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+
+  let resp: Response;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      resp = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    if (customFunctionState === 'deployed') {
+      throw new Error('لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة.');
+    }
+    return null;
+  }
+
+  const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+  if ((resp.status === 404 || resp.status === 403) && !contentType.includes('application/json')) {
+    customFunctionState = 'not_deployed';
+    return null;
+  }
+
+  const json = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!json || typeof json.ok !== 'boolean') {
+    if (customFunctionState !== 'deployed') {
+      customFunctionState = 'not_deployed';
+      return null;
+    }
+    throw new Error(`تعذّرت المصادقة مع الخادم (${resp.status}).`);
+  }
+
+  customFunctionState = 'deployed';
   if (!resp.ok || json.ok !== true) {
     const errMsg =
       typeof json.error === 'string' && json.error
@@ -112,6 +156,7 @@ async function invokeCustomAuthEndpoint(
         : `تعذّرت المصادقة مع الخادم (${resp.status}).`;
     throw new Error(errMsg);
   }
+
   return json;
 }
 
@@ -123,6 +168,7 @@ export const UsernameAuth = {
   },
 
   getSavedUsername(): string {
+    if (typeof localStorage === 'undefined') return '';
     try {
       return localStorage.getItem(LAST_USERNAME_KEY) || '';
     } catch {
@@ -131,6 +177,7 @@ export const UsernameAuth = {
   },
 
   saveUsername(username: string): void {
+    if (typeof localStorage === 'undefined') return;
     try {
       localStorage.setItem(LAST_USERNAME_KEY, username);
     } catch {
@@ -177,61 +224,57 @@ export const UsernameAuth = {
 
     activeAuthInProgress = true;
     try {
-      const endpoint = getCustomAuthEndpoint();
-      let signedInUser: User;
+      const customRes = await tryInvokeProjectCustomAuth({
+        action: 'register',
+        username: norm.username,
+        password: validPw,
+      });
 
-      if (endpoint) {
-        const res = await invokeCustomAuthEndpoint(endpoint, {
-          action: 'register',
-          username: norm.username,
-          password: validPw,
-        });
-        const cred = await signInWithCustomToken(auth, String(res.customToken));
-        signedInUser = cred.user;
+      let uid: string;
+      let key: CryptoKey | null;
+
+      if (customRes) {
+        const cred = await signInWithCustomToken(auth, String(customRes.customToken));
+        uid = cred.user.uid;
+        await CloudRepo.ensureUserProfile(norm, false);
+        const hasVault = await CloudRepo.hasCrypto(uid);
+        key = hasVault
+          ? await CloudRepo.unlock(validPw, uid)
+          : await CloudRepo.createCrypto(validPw, uid);
       } else {
-        const cred = await createUserWithEmailAndPassword(auth, norm.syntheticEmail, validPw);
-        signedInUser = cred.user;
-        try {
-          await updateProfile(signedInUser, { displayName: norm.username });
-        } catch {
-          // Non-fatal
-        }
+        uid = await deriveCapabilityUid(norm.usernameId, validPw);
+        key = await CloudRepo.registerCapabilityAccount(uid, norm, validPw);
       }
-
-      await CloudRepo.ensureUserProfile(norm, !endpoint);
-
-      const hasVault = await CloudRepo.hasCrypto();
-      const key = hasVault
-        ? await CloudRepo.unlock(validPw)
-        : await CloudRepo.createCrypto(validPw);
 
       if (!key) {
         throw new Error('تعذّر إعداد مفتاح التشفير للحساب.');
       }
 
-      await KeyVault.save(signedInUser.uid, key);
+      const session: AccountSession = { uid, username: norm.username };
+      await KeyVault.save(uid, key);
+      ActiveSessionStore.save(session);
 
-      const loadedPrefs = LocalPrefsStore.load(signedInUser.uid);
+      const loadedPrefs = LocalPrefsStore.load(uid);
       const nextPrefs: LocalDevicePrefs = {
         ...loadedPrefs,
         onboardingDone: true,
       };
-      LocalPrefsStore.save(signedInUser.uid, nextPrefs);
+      LocalPrefsStore.save(uid, nextPrefs);
       await CloudRepo.registerOrUpdateDevice(
         nextPrefs.deviceId,
         nextPrefs.deviceName,
         nextPrefs.model,
-        nextPrefs.enabled
+        nextPrefs.enabled,
+        uid
       );
 
       UsernameAuth.saveUsername(norm.username);
       clearClientFailures();
 
       return {
-        user: signedInUser,
+        session,
         vaultKey: key,
         prefs: nextPrefs,
-        username: norm.username,
       };
     } catch (err) {
       recordClientFailure();
@@ -248,61 +291,72 @@ export const UsernameAuth = {
 
     activeAuthInProgress = true;
     try {
-      const endpoint = getCustomAuthEndpoint();
-      let signedInUser: User;
+      const customRes = await tryInvokeProjectCustomAuth({
+        action: 'login',
+        username: norm.username,
+        password: validPw,
+      });
 
-      if (endpoint) {
-        const res = await invokeCustomAuthEndpoint(endpoint, {
-          action: 'login',
-          username: norm.username,
-          password: validPw,
-        });
-        const cred = await signInWithCustomToken(auth, String(res.customToken));
-        signedInUser = cred.user;
+      let uid: string;
+      let resolvedUsername = norm.username;
+      let key: CryptoKey | null;
+
+      if (customRes) {
+        const cred = await signInWithCustomToken(auth, String(customRes.customToken));
+        uid = cred.user.uid;
+        await CloudRepo.ensureUserProfile(norm, false);
+        const hasVault = await CloudRepo.hasCrypto(uid);
+        key = hasVault
+          ? await CloudRepo.unlock(validPw, uid)
+          : await CloudRepo.createCrypto(validPw, uid);
+        resolvedUsername = (await CloudRepo.getCurrentUsername(uid)) || norm.username;
       } else {
-        const cred = await signInWithEmailAndPassword(auth, norm.syntheticEmail, validPw);
-        signedInUser = cred.user;
+        uid = await deriveCapabilityUid(norm.usernameId, validPw);
+        const storedUsername = await CloudRepo.lookupCapabilityAccountUsername(uid);
+        if (!storedUsername) {
+          throw new Error('اسم المستخدم أو كلمة المرور غير صحيحة.');
+        }
+        resolvedUsername = storedUsername;
+        const hasVault = await CloudRepo.hasCrypto(uid);
+        key = hasVault
+          ? await CloudRepo.unlock(validPw, uid)
+          : await CloudRepo.createCrypto(validPw, uid);
       }
 
-      await CloudRepo.ensureUserProfile(norm, false);
-
-      const hasVault = await CloudRepo.hasCrypto();
-      const key = hasVault
-        ? await CloudRepo.unlock(validPw)
-        : await CloudRepo.createCrypto(validPw);
-
       if (!key) {
-        await firebaseSignOut(auth);
-        recordClientFailure();
+        if (auth.currentUser) {
+          await firebaseSignOut(auth);
+        }
         throw new Error('اسم المستخدم أو كلمة المرور غير صحيحة.');
       }
 
-      await KeyVault.save(signedInUser.uid, key);
+      const session: AccountSession = { uid, username: resolvedUsername };
+      await KeyVault.save(uid, key);
+      ActiveSessionStore.save(session);
 
-      const loadedPrefs = LocalPrefsStore.load(signedInUser.uid);
+      const loadedPrefs = LocalPrefsStore.load(uid);
       const nextPrefs: LocalDevicePrefs = {
         ...loadedPrefs,
         onboardingDone: true,
       };
       if (!loadedPrefs.onboardingDone) {
-        LocalPrefsStore.save(signedInUser.uid, nextPrefs);
+        LocalPrefsStore.save(uid, nextPrefs);
         await CloudRepo.registerOrUpdateDevice(
           nextPrefs.deviceId,
           nextPrefs.deviceName,
           nextPrefs.model,
-          nextPrefs.enabled
+          nextPrefs.enabled,
+          uid
         );
       }
 
-      const resolvedUsername = (await CloudRepo.getCurrentUsername()) || norm.username;
       UsernameAuth.saveUsername(resolvedUsername);
       clearClientFailures();
 
       return {
-        user: signedInUser,
+        session,
         vaultKey: key,
         prefs: nextPrefs,
-        username: resolvedUsername,
       };
     } catch (err) {
       recordClientFailure();
@@ -313,21 +367,27 @@ export const UsernameAuth = {
   },
 
   async deleteCustomAuthAccountIfConfigured(password: string): Promise<boolean> {
-    const endpoint = getCustomAuthEndpoint();
-    if (!endpoint) return false;
     const current = auth.currentUser;
-    if (!current) throw new Error('يلزم تسجيل الدخول أولًا.');
+    if (!current) return false;
+    const isPasswordProvider = current.providerData.some((p) => p.providerId === 'password');
+    if (isPasswordProvider) {
+      return false;
+    }
     const idToken = await current.getIdToken(false);
-    await invokeCustomAuthEndpoint(endpoint, { action: 'deleteAccount', password }, idToken);
+    const res = await tryInvokeProjectCustomAuth({ action: 'deleteAccount', password }, idToken);
+    if (!res) return false;
     await firebaseSignOut(auth);
     return true;
   },
 
   async signOut(): Promise<void> {
-    const uid = auth.currentUser?.uid;
+    const uid = ActiveSessionStore.getActiveUid();
     if (uid) {
       await KeyVault.clear(uid);
     }
-    await firebaseSignOut(auth);
+    ActiveSessionStore.clear();
+    if (auth.currentUser) {
+      await firebaseSignOut(auth);
+    }
   },
 };

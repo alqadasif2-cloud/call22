@@ -15,6 +15,7 @@ const {
   getDocs,
   query,
   where,
+  writeBatch,
   serverTimestamp,
 } = require('firebase/firestore');
 
@@ -22,6 +23,21 @@ let env;
 
 const usernameIdOf = (u) =>
   crypto.createHash('sha256').update('uname:' + u.trim().toLowerCase()).digest('hex').slice(0, 40);
+
+const deriveCapabilityUidOf = (usernameId, password) => {
+  const seed = crypto.pbkdf2Sync(
+    Buffer.from(password, 'utf8'),
+    Buffer.from(`personal-backup-auth-v2:${usernameId}`, 'utf8'),
+    2000,
+    32,
+    'sha256'
+  );
+  const hex = crypto
+    .createHash('sha256')
+    .update(Buffer.concat([Buffer.from('uid:', 'utf8'), seed]))
+    .digest('hex');
+  return `v_${hex.slice(0, 48)}`;
+};
 
 const devPayload = (ownerId = 'sami_uid', over = {}) => ({
   ownerId,
@@ -66,7 +82,6 @@ beforeEach(async () => {
   await env.clearFirestore();
 });
 
-// Custom Auth tokens do NOT have email or email_verified claims — verify they work seamlessly
 const sami = () => env.authenticatedContext('sami_uid').firestore();
 const bob = () => env.authenticatedContext('bob_uid').firestore();
 const anon = () => env.unauthenticatedContext().firestore();
@@ -112,10 +127,68 @@ test('حساب sami123 يسجّل بياناته ويقرأها من نفس ال
   );
 });
 
+test('المصادقة السحابية المباشرة باسم المستخدم وكلمة المرور دون إعداد خارجي وعزل كامل للحسابات', async () => {
+  const dbClient = anon();
+  const unameId = usernameIdOf('sami_app');
+  const capUid = deriveCapabilityUidOf(unameId, 'MyBackup2026!');
+
+  // 1) التسجيل الذري لحساب sami_app
+  const regBatch = writeBatch(dbClient);
+  regBatch.set(doc(dbClient, `usernames/${unameId}`), {
+    uid: capUid,
+    usernameLower: 'sami_app',
+    createdAt: serverTimestamp(),
+  });
+  regBatch.set(doc(dbClient, `users/${capUid}`), {
+    uid: capUid,
+    username: 'sami_app',
+    usernameLower: 'sami_app',
+    usernameId: unameId,
+    createdAt: serverTimestamp(),
+  });
+  await assertSucceeds(regBatch.commit());
+
+  // 2) منع تسجيل اسم المستخدم نفسه بكلمة مرور أخرى
+  const otherUid = deriveCapabilityUidOf(unameId, 'AnotherPass999!');
+  const dupBatch = writeBatch(dbClient);
+  dupBatch.set(doc(dbClient, `usernames/${unameId}`), {
+    uid: otherUid,
+    usernameLower: 'sami_app',
+    createdAt: serverTimestamp(),
+  });
+  dupBatch.set(doc(dbClient, `users/${otherUid}`), {
+    uid: otherUid,
+    username: 'sami_app',
+    usernameLower: 'sami_app',
+    usernameId: unameId,
+    createdAt: serverTimestamp(),
+  });
+  await assertFails(dupBatch.commit());
+
+  // 3) رفع جهاز وسجل مشفّر وقراءتهما من التطبيق الثاني بنفس المعرّف capUid
+  await assertSucceeds(setDoc(doc(dbClient, `users/${capUid}/devices/d1`), devPayload(capUid)));
+  await assertSucceeds(
+    setDoc(doc(dbClient, `users/${capUid}/devices/d1/records/r1`), recPayload(capUid, 'd1'))
+  );
+  await assertSucceeds(
+    getDocs(query(collection(dbClient, `users/${capUid}/devices`), where('ownerId', '==', capUid)))
+  );
+
+  // 4) منع حذف حجز اسم المستخدم منفردًا دون معرفة معرّف الحساب السري capUid
+  await assertFails(deleteDoc(doc(dbClient, `usernames/${unameId}`)));
+
+  // 5) الحذف الذري للحساب مع تحرير اسم المستخدم عند معرفة capUid
+  await assertSucceeds(deleteDoc(doc(dbClient, `users/${capUid}/devices/d1/records/r1`)));
+  await assertSucceeds(deleteDoc(doc(dbClient, `users/${capUid}/devices/d1`)));
+  const delBatch = writeBatch(dbClient);
+  delBatch.delete(doc(dbClient, `users/${capUid}`));
+  delBatch.delete(doc(dbClient, `usernames/${unameId}`));
+  await assertSucceeds(delBatch.commit());
+});
+
 test('منع تكرار أسماء المستخدمين ومنع استعراض سجل الأسماء من التطبيقات', async () => {
   await seedSami();
   const unameId = usernameIdOf('sami123');
-  // مستخدم آخر لا يستطيع حجز نفس اسم المستخدم sami123 (حتى بحروف كبيرة SAMI123)
   await assertFails(
     setDoc(doc(bob(), `usernames/${usernameIdOf('SAMI123')}`), {
       uid: 'bob_uid',
@@ -123,10 +196,10 @@ test('منع تكرار أسماء المستخدمين ومنع استعراض 
       createdAt: serverTimestamp(),
     })
   );
-  // منع قراءة أو سرد مجموعة usernames لمنع تخمين الحسابات
   await assertFails(getDoc(doc(sami(), `usernames/${unameId}`)));
   await assertFails(getDoc(doc(bob(), `usernames/${unameId}`)));
   await assertFails(getDocs(collection(bob(), 'usernames')));
+  await assertFails(getDocs(collection(anon(), 'users')));
 });
 
 test('منع التطبيقات تمامًا من قراءة أو تعديل سجلات كلمات المرور أو عدادات المحاولات', async () => {
@@ -142,7 +215,7 @@ test('منع التطبيقات تمامًا من قراءة أو تعديل س�
   await assertFails(deleteDoc(doc(sami(), 'authRateLimits/ip_127_0_0_1')));
 });
 
-test('غير المصادق عليه ممنوع من القراءة والكتابة', async () => {
+test('غير المصادق عليه ممنوع من القراءة والكتابة على حسابات UID العادية', async () => {
   await seedSami();
   await assertFails(getDoc(doc(anon(), 'users/sami_uid/devices/d1/records/r1')));
   await assertFails(setDoc(doc(anon(), 'users/sami_uid/devices/d2'), devPayload('sami_uid')));

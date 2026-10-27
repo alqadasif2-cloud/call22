@@ -29,6 +29,11 @@ export enum PeriodFilter {
   Y1 = 'Y1',
 }
 
+export interface AccountSession {
+  uid: string;
+  username: string;
+}
+
 export interface CallFields {
   number: string;
   type: string;
@@ -128,4 +133,3 @@ export interface NormalizedUsername {
   usernameId: string;
   syntheticEmail: string;
 }
-

@@ -14,8 +14,13 @@ if (!admin.apps.length) {
   admin.initializeApp();
 }
 
+const DEFAULT_FIRESTORE_DATABASE_ID = 'ai-studio-9b45ca49-21a0-4eb7-af13-f761f2dd91e9';
+
 function resolveFirestore() {
-  const dbId = process.env.FIRESTORE_DATABASE_ID;
+  if (process.env.FUNCTIONS_EMULATOR === 'true' && !process.env.FIRESTORE_DATABASE_ID) {
+    return getFirestore(admin.app());
+  }
+  const dbId = process.env.FIRESTORE_DATABASE_ID || DEFAULT_FIRESTORE_DATABASE_ID;
   if (dbId && dbId !== '(default)') {
     return getFirestore(admin.app(), dbId);
   }
@@ -117,7 +122,9 @@ function buildAdminStore(db) {
  *   - POST { action: 'login', username, password }    -> { ok: true, uid, username, customToken }
  *   - POST { action: 'deleteAccount', password } (with Authorization: Bearer <idToken>) -> { ok: true }
  */
-exports.authUsername = onRequest({ cors: true, maxInstances: 10 }, async (req, res) => {
+exports.authUsername = onRequest(
+  { region: 'us-central1', cors: true, maxInstances: 10 },
+  async (req, res) => {
   if (req.method !== 'POST') {
     res.status(405).json({ ok: false, code: 'method-not-allowed', error: 'الطريقة غير مسموحة.' });
     return;

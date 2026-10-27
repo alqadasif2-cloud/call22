@@ -14,6 +14,7 @@ import {
   collection,
   query,
   where,
+  writeBatch,
   serverTimestamp,
   Timestamp,
 } from 'firebase/firestore';
@@ -28,8 +29,23 @@ function computeUsernameId(username: string): string {
     .slice(0, 40);
 }
 
+function deriveCapabilityUidNode(usernameId: string, password: string): string {
+  const seed = crypto.pbkdf2Sync(
+    Buffer.from(password, 'utf8'),
+    Buffer.from(`personal-backup-auth-v2:${usernameId}`, 'utf8'),
+    2000,
+    32,
+    'sha256'
+  );
+  const hex = crypto
+    .createHash('sha256')
+    .update(Buffer.concat([Buffer.from('uid:', 'utf8'), seed]))
+    .digest('hex');
+  return `v_${hex.slice(0, 48)}`;
+}
+
 /**
- * Adversarial Security Rules Verification Suite ("Dirty Dozen" Payloads)
+ * Adversarial Security Rules Verification Suite ("Dirty Dozen" Payloads + Capability Accounts)
  * Verifies that all 12 attack vectors defined in security_spec.md return PERMISSION_DENIED.
  */
 export async function runRulesSecuritySuite(): Promise<void> {
@@ -41,7 +57,6 @@ export async function runRulesSecuritySuite(): Promise<void> {
   });
 
   try {
-    // Custom Auth tokens (no email or email_verified required)
     const samiCtx = testEnv.authenticatedContext('sami_uid');
     const malloryCtx = testEnv.authenticatedContext('mallory_uid');
     const anonCtx = testEnv.unauthenticatedContext();
@@ -52,7 +67,7 @@ export async function runRulesSecuritySuite(): Promise<void> {
 
     const samiUnameId = computeUsernameId('sami123');
 
-    // Baseline valid registration & backup setup for sami123
+    // Baseline valid registration & backup setup for sami123 (Custom Auth)
     await assertSucceeds(
       setDoc(doc(samiDb, `usernames/${samiUnameId}`), {
         uid: 'sami_uid',
@@ -108,6 +123,53 @@ export async function runRulesSecuritySuite(): Promise<void> {
         updatedAt: serverTimestamp(),
       })
     );
+
+    // Baseline valid Direct Cloud Capability Account (zero-setup username + password)
+    const nourUnameId = computeUsernameId('nour2026');
+    const nourUid = deriveCapabilityUidNode(nourUnameId, 'MyBackup2026!');
+    const regBatch = writeBatch(anonDb);
+    regBatch.set(doc(anonDb, `usernames/${nourUnameId}`), {
+      uid: nourUid,
+      usernameLower: 'nour2026',
+      createdAt: serverTimestamp(),
+    });
+    regBatch.set(doc(anonDb, `users/${nourUid}`), {
+      uid: nourUid,
+      username: 'nour2026',
+      usernameLower: 'nour2026',
+      usernameId: nourUnameId,
+      createdAt: serverTimestamp(),
+    });
+    regBatch.set(doc(anonDb, `users/${nourUid}/meta/crypto`), {
+      uid: nourUid,
+      salt: 'AAAAAAAAAAAAAAAAAAAAAA==',
+      iter: 310000,
+      checkIv: 'BBBBBBBBBBBBBBBB',
+      check: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      v: 1,
+      createdAt: serverTimestamp(),
+    });
+    await assertSucceeds(regBatch.commit());
+
+    // Duplicate capability registration with same username (different password) MUST fail
+    const attackerUid = deriveCapabilityUidNode(nourUnameId, 'OtherPass999!');
+    const dupBatch = writeBatch(anonDb);
+    dupBatch.set(doc(anonDb, `usernames/${nourUnameId}`), {
+      uid: attackerUid,
+      usernameLower: 'nour2026',
+      createdAt: serverTimestamp(),
+    });
+    dupBatch.set(doc(anonDb, `users/${attackerUid}`), {
+      uid: attackerUid,
+      username: 'nour2026',
+      usernameLower: 'nour2026',
+      usernameId: nourUnameId,
+      createdAt: serverTimestamp(),
+    });
+    await assertFails(dupBatch.commit());
+
+    // Standalone deletion of /usernames/{nourUnameId} without knowing secret nourUid MUST fail
+    await assertFails(deleteDoc(doc(anonDb, `usernames/${nourUnameId}`)));
 
     // 1. Client Read/Write of Password Records (/authCredentials)
     await assertFails(getDoc(doc(samiDb, `authCredentials/${samiUnameId}`)));
@@ -244,7 +306,9 @@ export async function runRulesSecuritySuite(): Promise<void> {
     );
 
     // 12. Cross-Account Backup Scraping (get & list)
+    await assertFails(getDocs(collection(anonDb, 'users')));
     await assertFails(getDoc(doc(malloryDb, 'users/sami_uid')));
+    await assertFails(getDoc(doc(malloryDb, `users/${nourUid}`)));
     await assertFails(getDoc(doc(malloryDb, 'users/sami_uid/meta/crypto')));
     await assertFails(
       getDocs(

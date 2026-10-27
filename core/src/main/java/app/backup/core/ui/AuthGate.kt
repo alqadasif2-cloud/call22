@@ -19,6 +19,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,67 +32,46 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import app.backup.core.AuthMessages
-import app.backup.core.KeyVault
 import app.backup.core.Session
 import app.backup.core.UsernameAuth
 import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-/** بوابة المصادقة المبسّطة: تسجيل الدخول أو إنشاء حساب باسم المستخدم وكلمة المرور والدخول مباشرةً للتطبيق. */
+/** بوابة المصادقة المبسّطة: تسجيل الدخول أو إنشاء حساب باسم المستخدم وكلمة المرور وحفظ الجلسة بأمان. */
 @Composable
 fun AuthGate(content: @Composable () -> Unit) {
     val ctx = LocalContext.current
     val auth = remember { FirebaseAuth.getInstance() }
-    val vault = remember { KeyVault(ctx.applicationContext) }
-    var user by remember { mutableStateOf(auth.currentUser) }
-    var ready by remember { mutableStateOf(auth.currentUser != null && Session.key != null) }
-    var checking by remember { mutableStateOf(true) }
+    val activeUid by Session.uidFlow.collectAsState()
+    var checking by remember { mutableStateOf(activeUid.isNullOrBlank() || Session.key == null) }
 
     DisposableEffect(Unit) {
         val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
             val current = firebaseAuth.currentUser
-            user = current
-            if (current == null) {
-                Session.key = null
-                vault.clear()
-                ready = false
-            } else if (Session.key != null) {
-                ready = true
+            if (current != null && Session.key != null && Session.uid.isNullOrBlank()) {
+                Session.uid = current.uid
             }
         }
         auth.addAuthStateListener(listener)
         onDispose { auth.removeAuthStateListener(listener) }
     }
 
-    LaunchedEffect(user?.uid) {
-        val current = user
-        if (current == null) {
-            ready = false
-            checking = false
-            return@LaunchedEffect
-        }
-        if (Session.key != null) {
-            ready = true
-            checking = false
-            return@LaunchedEffect
-        }
-        val storedKey = vault.load()
-        if (storedKey != null) {
-            Session.key = storedKey
-            ready = true
-        } else if (!UsernameAuth.inProgress) {
-            UsernameAuth.signOut(ctx, auth)
-            ready = false
+    LaunchedEffect(Unit) {
+        if (activeUid.isNullOrBlank() || Session.key == null) {
+            withContext(Dispatchers.IO) {
+                Session.ensureLoaded(ctx.applicationContext)
+            }
         }
         checking = false
     }
 
+    val isAuthenticated = !activeUid.isNullOrBlank() && Session.key != null
+
     when {
         checking -> Loading()
-        user == null || !ready -> UsernameAuthScreen(auth) {
-            user = auth.currentUser
-            ready = true
-        }
+        !isAuthenticated -> UsernameAuthScreen(auth) {}
         else -> content()
     }
 }

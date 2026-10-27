@@ -4,7 +4,7 @@
  */
 
 import React, { Component, ErrorInfo, ReactNode, useEffect, useState } from 'react';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { onAuthStateChanged } from 'firebase/auth';
 import { UsernameAuthGate } from './components/AuthAndVaultGate';
 import { BackupSourceView } from './components/BackupSourceView';
 import { DevicesView } from './components/DevicesView';
@@ -14,14 +14,14 @@ import { SecurityAndAccountView } from './components/SecurityAndAccountView';
 import { CloudRepo } from './core/cloudRepo';
 import { KeyVault } from './core/crypto';
 import {
+  ActiveSessionStore,
   auth,
   bootstrapFirebaseSession,
   friendlyErrorMessageAr,
-  isTokenServiceDisabledError,
   SessionBootstrapState,
 } from './core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore } from './core/localQueue';
-import { DeviceInfo } from './core/types';
+import { AccountSession, DeviceInfo } from './core/types';
 import { AuthSessionResult, UsernameAuth } from './core/usernameAuth';
 
 type ActiveSection = 'devices' | 'explorer' | 'backup' | 'security';
@@ -65,8 +65,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryS
 
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
-  const [username, setUsername] = useState<string>('');
+  const [session, setSession] = useState<AccountSession | null>(null);
   const [sessionNotice, setSessionNotice] = useState<SessionBootstrapState | null>(null);
   const [vaultKey, setVaultKey] = useState<CryptoKey | null>(null);
   const [prefs, setPrefs] = useState<LocalDevicePrefs | null>(null);
@@ -78,136 +77,109 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unsubAuth: (() => void) | null = null;
-    let expiryTimer: number | null = null;
+    let unsubStore: (() => void) | null = null;
 
-    const clearExpiryTimer = () => {
-      if (expiryTimer !== null) {
-        window.clearTimeout(expiryTimer);
-        expiryTimer = null;
+    const restoreSession = async () => {
+      if (UsernameAuth.inProgress) {
+        if (!disposed) setAuthReady(true);
+        return;
       }
-    };
 
-    const scheduleTokenRefresh = async (activeUser: User) => {
-      try {
-        const tokenResult = await activeUser.getIdTokenResult(false);
-        const expMs = Date.parse(tokenResult.expirationTime);
-        if (!Number.isNaN(expMs) && !disposed) {
-          const msUntilCheck = Math.max(10_000, expMs - Date.now() - 45_000);
-          expiryTimer = window.setTimeout(() => {
-            void (async () => {
-              try {
-                await activeUser.getIdToken(true);
-              } catch (err) {
-                const disabled = isTokenServiceDisabledError(err);
-                await UsernameAuth.signOut();
-                if (!disposed) {
-                  setSessionNotice({
-                    sessionExpiredReset: true,
-                    tokenServiceDisabled: disabled,
-                    activationUrl: null,
-                  });
-                }
-              }
-            })();
-          }, msUntilCheck);
+      const persisted = ActiveSessionStore.load();
+      const fbUser = auth.currentUser;
+      const candidateUid = persisted?.uid || fbUser?.uid || null;
+
+      if (!candidateUid) {
+        if (!disposed) {
+          setSession(null);
+          setVaultKey(null);
+          setSelectedDevice(null);
+          setExportDevice(null);
+          setPrefs(null);
+          setAuthReady(true);
         }
-      } catch {
-        // Handled by auth guard
+        return;
+      }
+
+      const cachedKey = await KeyVault.load(candidateUid);
+      if (!cachedKey) {
+        await UsernameAuth.signOut();
+        if (!disposed) {
+          setSession(null);
+          setVaultKey(null);
+          setPrefs(null);
+          setAuthReady(true);
+        }
+        return;
+      }
+
+      const loadedPrefs = LocalPrefsStore.load(candidateUid);
+      let resolvedName =
+        persisted?.username || UsernameAuth.getSavedUsername() || fbUser?.displayName || '';
+      if (!resolvedName) {
+        try {
+          resolvedName = (await CloudRepo.getCurrentUsername(candidateUid)) || '';
+        } catch {
+          // Offline or transient; keep empty fallback
+        }
+      }
+
+      const active: AccountSession = {
+        uid: candidateUid,
+        username: resolvedName || candidateUid.slice(0, 10),
+      };
+
+      if (!persisted) {
+        ActiveSessionStore.save(active);
+      }
+
+      if (!disposed) {
+        setSessionNotice(null);
+        setSession(active);
+        setVaultKey(cachedKey);
+        setPrefs(loadedPrefs);
+        setAuthReady(true);
       }
     };
 
     void (async () => {
       const boot = await bootstrapFirebaseSession();
       if (disposed) return;
-      if (boot.sessionExpiredReset) {
+      if (boot.sessionExpiredReset && !ActiveSessionStore.load()) {
         setSessionNotice(boot);
       }
 
-      unsubAuth = onAuthStateChanged(auth, (nextUser) => {
-        clearExpiryTimer();
-        void (async () => {
-          if (UsernameAuth.inProgress) {
-            if (nextUser) {
-              await scheduleTokenRefresh(nextUser);
-            }
-            if (!disposed) setAuthReady(true);
-            return;
-          }
+      await restoreSession();
 
-          if (nextUser) {
-            try {
-              const cachedKey = await KeyVault.load(nextUser.uid);
-              if (!cachedKey) {
-                await UsernameAuth.signOut();
-                if (!disposed) {
-                  setUser(null);
-                  setVaultKey(null);
-                  setPrefs(null);
-                  setAuthReady(true);
-                }
-                return;
-              }
+      unsubStore = ActiveSessionStore.subscribe((next) => {
+        if (!next && !disposed) {
+          setSession(null);
+          setVaultKey(null);
+          setSelectedDevice(null);
+          setExportDevice(null);
+          setPrefs(null);
+        }
+      });
 
-              await scheduleTokenRefresh(nextUser);
-              const loadedPrefs = LocalPrefsStore.load(nextUser.uid);
-              let resolvedName = UsernameAuth.getSavedUsername() || nextUser.displayName || '';
-              if (!resolvedName) {
-                try {
-                  resolvedName = (await CloudRepo.getCurrentUsername()) || '';
-                } catch {
-                  // Offline or transient; keep empty fallback
-                }
-              }
-
-              if (!disposed) {
-                setSessionNotice(null);
-                setUser(nextUser);
-                setVaultKey(cachedKey);
-                setPrefs(loadedPrefs);
-                setUsername(resolvedName);
-              }
-            } catch (err) {
-              const disabled = isTokenServiceDisabledError(err);
-              await UsernameAuth.signOut();
-              if (!disposed) {
-                setUser(null);
-                setPrefs(null);
-                setVaultKey(null);
-                setSessionNotice({
-                  sessionExpiredReset: true,
-                  tokenServiceDisabled: disabled,
-                  activationUrl: null,
-                });
-              }
-            }
-          } else if (!disposed) {
-            setUser(null);
-            setVaultKey(null);
-            setSelectedDevice(null);
-            setExportDevice(null);
-            setPrefs(null);
-          }
-
-          if (!disposed) {
-            setAuthReady(true);
-          }
-        })();
+      unsubAuth = onAuthStateChanged(auth, () => {
+        if (!UsernameAuth.inProgress) {
+          void restoreSession();
+        }
       });
     })();
 
     return () => {
       disposed = true;
-      clearExpiryTimer();
+      if (unsubStore) unsubStore();
       if (unsubAuth) unsubAuth();
     };
   }, []);
 
-  const handleAuthenticated = (session: AuthSessionResult) => {
+  const handleAuthenticated = (res: AuthSessionResult) => {
     setSessionNotice(null);
-    setUser(session.user);
-    setVaultKey(session.vaultKey);
-    setPrefs(session.prefs);
-    setUsername(session.username);
+    setSession(res.session);
+    setVaultKey(res.vaultKey);
+    setPrefs(res.prefs);
     setSelectedDevice(null);
     setExportDevice(null);
     setSection('devices');
@@ -217,7 +189,7 @@ export default function App() {
     await UsernameAuth.signOut();
   };
 
-  const isAuthenticated = Boolean(user && vaultKey && prefs);
+  const isAuthenticated = Boolean(session && vaultKey && prefs);
 
   return (
     <AppErrorBoundary>
@@ -355,7 +327,7 @@ export default function App() {
               onAuthenticated={handleAuthenticated}
               sessionNotice={sessionNotice}
             />
-          ) : user && vaultKey && prefs ? (
+          ) : session && vaultKey && prefs ? (
             <div className="mx-auto max-w-6xl px-6 py-8">
               {section === 'devices' && (
                 <DevicesView
@@ -382,7 +354,7 @@ export default function App() {
 
               {section === 'backup' && (
                 <BackupSourceView
-                  uid={user.uid}
+                  uid={session.uid}
                   vaultKey={vaultKey}
                   prefs={prefs}
                   onUpdatePrefs={setPrefs}
@@ -392,8 +364,7 @@ export default function App() {
 
               {section === 'security' && (
                 <SecurityAndAccountView
-                  user={user}
-                  username={username}
+                  session={session}
                   prefs={prefs}
                   onCloudChanged={() => setCloudRefreshCounter((c) => c + 1)}
                 />

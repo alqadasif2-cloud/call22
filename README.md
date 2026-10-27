@@ -17,7 +17,16 @@
 - **قواعد أمان صارمة (`firestore.rules`):**
   - عزل كامل لكل مستخدم، التحقق من ملكية الجهاز الأب (`Master Gate`)، فرض حدود الأحجام والأنواع، ومنع التعديل على جذر التشفير `meta/crypto` بعد إنشائه.
 
-## التشغيل المحلي
+## هيكل المستودع الموحّد (الويب + أندرويد + GitHub Actions)
+
+يجمع هذا المستودع بين **نسخة الويب المتكاملة** و**تطبيقي أندرويد الأصليين** مع مسار البناء والاختبار التلقائي عبر **GitHub Actions**:
+
+- `src/` و`firestore.rules`: تطبيق الويب المتكامل (React + TypeScript + Vite) المتصل مباشرةً بـ Firebase Auth وCloud Firestore.
+- `core/` و`backup-app/` و`viewer-app/`: وحدات أندرويد الأصلية (Kotlin + Jetpack Compose + Gradle) لبناء ملفي `APK` (`backup-app` و`viewer-app`).
+- `firebase/` و`firebase/rules-test/`: قواعد الأمان والفهارس واختبارات محاكي Firestore الخاصة بمسار التكامل المستمر (`npm install --prefix firebase/rules-test`).
+- `.github/workflows/build.yml`: مسار GitHub Actions لتشغيل اختبارات الوحدة، اختبار قواعد Firebase على المحاكي، وبناء ملفي `APK` (راجع `SETUP_AR.md` لإضافة السر `GOOGLE_SERVICES_JSON_BASE64`).
+
+## التشغيل المحلي لنسخة الويب
 
 ```bash
 npm install

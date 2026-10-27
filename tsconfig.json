@@ -25,5 +25,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["dist"]
+  "exclude": ["dist", "node_modules", "firebase", "core", "backup-app", "viewer-app"]
 }

@@ -21,14 +21,18 @@ firebase deploy --only firestore:rules,firestore:indexes
 
 ## 3) GitHub
 1. ارفع المشروع إلى مستودعك (الملف `google-services.json` مستثنى في `.gitignore`).
-2. حوّل الملف إلى base64:
-   ```bash
-   base64 -w0 google-services.json        # على macOS: base64 -i google-services.json
-   ```
-3. **Settings ← Secrets and variables ← Actions ← New repository secret**
-   الاسم: `GOOGLE_SERVICES_JSON_BASE64`، والقيمة: الناتج أعلاه.
-4. ادفع أي تعديل (أو شغّل Workflow يدويًا). سترى ثلاث مهام: اختبارات الوحدة، اختبار قواعد Firebase، بناء APK.
-5. من صفحة التشغيل ← **Artifacts** نزّل `backup-app-apk` و`viewer-app-apk`.
+2. من صفحة مستودعك على GitHub افتح:
+   **Settings ← Secrets and variables ← Actions ← New repository secret**
+3. في حقل **Name** اكتب بالضبط:
+   `GOOGLE_SERVICES_JSON_BASE64`
+4. في حقل **Secret** يمكنك اختيار إحدى الطريقتين (يدعم مسار البناء الطريقتين تلقائيًا):
+   - **الطريقة الأسهل (بدون طرفية):** افتح ملف `google-services.json` بأي محرر نصوص، انسخ كامل محتواه النصي كما هو (يبدأ بـ `{` وينتهي بـ `}`) والصقه مباشرةً.
+   - **أو بصيغة Base64:**
+     ```bash
+     base64 -w0 google-services.json        # على macOS: base64 -i google-services.json
+     ```
+5. احفظ السر عبر **Add secret**، ثم أعد تشغيل Workflow (أو ادفع التحديثات). سترى ثلاث مهام خضراء: اختبارات الوحدة، اختبار قواعد Firebase، وبناء APK.
+6. من صفحة التشغيل ← **Artifacts** نزّل `backup-app-apk` و`viewer-app-apk`.
 
 ## 4) التثبيت على الهاتف
 - فعّل «التثبيت من مصادر غير معروفة» لمتصفحك أو مدير الملفات ثم ثبّت الملفين.

@@ -50,11 +50,46 @@ jobs:
         with: { gradle-version: "8.9" }
       - name: Restore google-services.json from secret
         env:
-          GS: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          GS_B64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          GS_RAW: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
-          if [ -z "$GS" ]; then echo "::error::أضف السر GOOGLE_SERVICES_JSON_BASE64 (راجع SETUP_AR.md)"; exit 1; fi
-          echo "$GS" | base64 -d > backup-app/google-services.json
-          echo "$GS" | base64 -d > viewer-app/google-services.json
+          python3 - <<'PY'
+          import base64, json, os, pathlib, sys
+
+          raw = (os.environ.get("GS_B64") or os.environ.get("GS_RAW") or "").strip()
+          if not raw:
+              print("::error::أضف السر GOOGLE_SERVICES_JSON_BASE64 في إعدادات مستودع GitHub (Settings -> Secrets and variables -> Actions -> New repository secret). يمكنك لصق محتوى google-services.json النصي مباشرة أو بصيغة Base64.", file=sys.stderr)
+              sys.exit(1)
+
+          if raw.startswith("{"):
+              content = raw.encode("utf-8")
+          else:
+              cleaned = "".join(raw.split())
+              try:
+                  content = base64.b64decode(cleaned)
+              except Exception as exc:
+                  print(f"::error::تعذر فك ترميز GOOGLE_SERVICES_JSON_BASE64 ({exc}). الصق محتوى ملف google-services.json مباشرة أو بصيغة Base64 صحيحة.", file=sys.stderr)
+                  sys.exit(1)
+
+          try:
+              parsed = json.loads(content.decode("utf-8-sig"))
+          except Exception as exc:
+              print(f"::error::محتوى السر ليس ملف google-services.json صالحًا ({exc}).", file=sys.stderr)
+              sys.exit(1)
+
+          pkgs = {
+              c.get("client_info", {}).get("android_client_info", {}).get("package_name")
+              for c in parsed.get("client", [])
+          }
+          missing = {"app.backup.source", "app.backup.viewer"} - pkgs
+          if missing:
+              print(f"::error::ملف google-services.json لا يحتوي على الحزم المطلوبة: {', '.join(sorted(missing))}. سجّل التطبيقين في إعدادات مشروع Firebase ثم أعد تنزيل الملف.", file=sys.stderr)
+              sys.exit(1)
+
+          for target in ("backup-app/google-services.json", "viewer-app/google-services.json"):
+              pathlib.Path(target).write_bytes(content)
+          print("تمت استعادة والتحقق من google-services.json بنجاح للحزمتين app.backup.source و app.backup.viewer.")
+          PY
       - name: Assemble APKs
         run: gradle --no-daemon :backup-app:assembleDebug :viewer-app:assembleDebug
       - uses: actions/upload-artifact@v4

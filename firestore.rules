@@ -1,0 +1,211 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isVerifiedOwner(uid) {
+      return isOwner(uid) && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Master Gate: Verifies parent device exists and belongs to the authenticated owner
+    function hasOwnedParentDevice(uid, deviceId) {
+      return exists(/databases/$(database)/documents/users/$(uid)/devices/$(deviceId))
+        && get(/databases/$(database)/documents/users/$(uid)/devices/$(deviceId)).data.ownerId == request.auth.uid;
+    }
+
+    // Validation Blueprint: CryptoMeta (/users/{uid}/meta/crypto)
+    function isValidCryptoMeta(data, uid) {
+      return data.keys().hasAll(['uid', 'salt', 'iter', 'checkIv', 'check', 'v', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'salt', 'iter', 'checkIv', 'check', 'v', 'createdAt'])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.uid == uid
+        && data.salt is string
+        && data.salt.size() >= 16
+        && data.salt.size() <= 64
+        && data.iter is int
+        && data.iter >= 100000
+        && data.iter <= 1000000
+        && data.checkIv is string
+        && data.checkIv.size() >= 12
+        && data.checkIv.size() <= 64
+        && data.check is string
+        && data.check.size() >= 16
+        && data.check.size() <= 256
+        && data.v is int
+        && data.v == 1
+        && data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: Device (/users/{uid}/devices/{deviceId})
+    function isValidDevice(data, uid) {
+      return data.keys().hasAll(['ownerId', 'name', 'model', 'enabled', 'lastSyncAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'model', 'enabled', 'lastSyncAt', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.ownerId == uid
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 100
+        && data.model is string
+        && data.model.size() >= 1
+        && data.model.size() <= 100
+        && data.enabled is list
+        && data.enabled.size() <= 3
+        && data.enabled.hasOnly(['call', 'sms', 'clip'])
+        && data.lastSyncAt is int
+        && data.lastSyncAt >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: EncRecord (/users/{uid}/devices/{deviceId}/records/{recId})
+    function isValidRecord(data, uid, deviceId) {
+      return data.keys().hasAll(['ownerId', 'deviceId', 'type', 'ts', 'iv', 'data', 'v', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'deviceId', 'type', 'ts', 'iv', 'data', 'v', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.ownerId == uid
+        && data.deviceId is string
+        && data.deviceId.size() >= 1
+        && data.deviceId.size() <= 128
+        && data.deviceId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.deviceId == deviceId
+        && data.type is string
+        && data.type.size() >= 3
+        && data.type.size() <= 10
+        && data.type in ['call', 'sms', 'clip']
+        && data.ts is int
+        && data.ts > 0
+        && data.ts <= 9999999999999
+        && data.iv is string
+        && data.iv.size() >= 12
+        && data.iv.size() <= 64
+        && data.data is string
+        && data.data.size() >= 16
+        && data.data.size() <= 500000
+        && data.v is int
+        && data.v == 1
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Cryptographic Root Metadata (Immutable after creation; no list queries permitted)
+    match /users/{uid}/meta/{metaId} {
+      allow get: if isOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
+      allow list: if false;
+      allow create: if isVerifiedOwner(uid)
+        && isValidId(uid)
+        && metaId == 'crypto'
+        && isValidCryptoMeta(incoming(), uid)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isVerifiedOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
+    }
+
+    // Registered Backup Devices
+    match /users/{uid}/devices/{deviceId} {
+      allow get: if isOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
+      allow list: if isOwner(uid) && isValidId(uid) && existing().ownerId == request.auth.uid;
+      allow create: if isVerifiedOwner(uid)
+        && isValidId(uid)
+        && isValidId(deviceId)
+        && isValidDevice(incoming(), uid)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedOwner(uid)
+        && isValidId(uid)
+        && isValidId(deviceId)
+        && isValidDevice(incoming(), uid)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Update device metadata / enabled categories
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'updatedAt'])
+          // Action 2: Mark device sync timestamp
+          || incoming().diff(existing()).affectedKeys().hasOnly(['lastSyncAt', 'updatedAt'])
+          // Action 3: Combined metadata and sync update
+          || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'lastSyncAt', 'updatedAt'])
+        );
+      allow delete: if isVerifiedOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
+
+      // Encrypted Records Subcollection (Protected by Master Gate + Query Enforcer)
+      match /records/{recId} {
+        allow get: if isOwner(uid)
+          && isValidId(uid)
+          && isValidId(deviceId)
+          && isValidId(recId)
+          && (resource == null || existing().ownerId == request.auth.uid)
+          && hasOwnedParentDevice(uid, deviceId);
+        allow list: if isOwner(uid)
+          && isValidId(uid)
+          && isValidId(deviceId)
+          && existing().ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(uid)
+          && isValidId(uid)
+          && isValidId(deviceId)
+          && isValidId(recId)
+          && isValidRecord(incoming(), uid, deviceId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasOwnedParentDevice(uid, deviceId);
+        allow update: if isVerifiedOwner(uid)
+          && isValidId(uid)
+          && isValidId(deviceId)
+          && isValidId(recId)
+          && isValidRecord(incoming(), uid, deviceId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().deviceId == existing().deviceId
+          && incoming().type == existing().type
+          && incoming().ts == existing().ts
+          && incoming().v == existing().v
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['iv', 'data', 'updatedAt'])
+          && hasOwnedParentDevice(uid, deviceId);
+        allow delete: if isVerifiedOwner(uid)
+          && isValidId(uid)
+          && isValidId(deviceId)
+          && isValidId(recId)
+          && (resource == null || existing().ownerId == request.auth.uid)
+          && hasOwnedParentDevice(uid, deviceId);
+      }
+    }
+  }
+}

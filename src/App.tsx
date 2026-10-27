@@ -5,13 +5,14 @@
 
 import React, { Component, ErrorInfo, ReactNode, useEffect, useState } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { SignInLanding, VaultPassphraseGate } from './components/AuthAndVaultGate';
+import { UsernameAuthGate } from './components/AuthAndVaultGate';
 import { BackupSourceView } from './components/BackupSourceView';
 import { DevicesView } from './components/DevicesView';
 import { ExportModal } from './components/Dialogs';
 import { RecordsExplorerView } from './components/RecordsExplorerView';
 import { SecurityAndAccountView } from './components/SecurityAndAccountView';
 import { CloudRepo } from './core/cloudRepo';
+import { KeyVault } from './core/crypto';
 import {
   auth,
   bootstrapFirebaseSession,
@@ -21,6 +22,7 @@ import {
 } from './core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore } from './core/localQueue';
 import { DeviceInfo } from './core/types';
+import { AuthSessionResult, UsernameAuth } from './core/usernameAuth';
 
 type ActiveSection = 'devices' | 'explorer' | 'backup' | 'security';
 
@@ -64,6 +66,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryS
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState<User | null>(null);
+  const [username, setUsername] = useState<string>('');
   const [sessionNotice, setSessionNotice] = useState<SessionBootstrapState | null>(null);
   const [vaultKey, setVaultKey] = useState<CryptoKey | null>(null);
   const [prefs, setPrefs] = useState<LocalDevicePrefs | null>(null);
@@ -84,6 +87,35 @@ export default function App() {
       }
     };
 
+    const scheduleTokenRefresh = async (activeUser: User) => {
+      try {
+        const tokenResult = await activeUser.getIdTokenResult(false);
+        const expMs = Date.parse(tokenResult.expirationTime);
+        if (!Number.isNaN(expMs) && !disposed) {
+          const msUntilCheck = Math.max(10_000, expMs - Date.now() - 45_000);
+          expiryTimer = window.setTimeout(() => {
+            void (async () => {
+              try {
+                await activeUser.getIdToken(true);
+              } catch (err) {
+                const disabled = isTokenServiceDisabledError(err);
+                await UsernameAuth.signOut();
+                if (!disposed) {
+                  setSessionNotice({
+                    sessionExpiredReset: true,
+                    tokenServiceDisabled: disabled,
+                    activationUrl: null,
+                  });
+                }
+              }
+            })();
+          }, msUntilCheck);
+        }
+      } catch {
+        // Handled by auth guard
+      }
+    };
+
     void (async () => {
       const boot = await bootstrapFirebaseSession();
       if (disposed) return;
@@ -94,44 +126,49 @@ export default function App() {
       unsubAuth = onAuthStateChanged(auth, (nextUser) => {
         clearExpiryTimer();
         void (async () => {
+          if (UsernameAuth.inProgress) {
+            if (nextUser) {
+              await scheduleTokenRefresh(nextUser);
+            }
+            if (!disposed) setAuthReady(true);
+            return;
+          }
+
           if (nextUser) {
             try {
-              const tokenResult = await nextUser.getIdTokenResult(false);
-              if (disposed) return;
-              setSessionNotice(null);
-              setUser(nextUser);
-              setVaultKey(null);
-              setSelectedDevice(null);
-              setExportDevice(null);
-              setPrefs(LocalPrefsStore.load(nextUser.uid));
+              const cachedKey = await KeyVault.load(nextUser.uid);
+              if (!cachedKey) {
+                await UsernameAuth.signOut();
+                if (!disposed) {
+                  setUser(null);
+                  setVaultKey(null);
+                  setPrefs(null);
+                  setAuthReady(true);
+                }
+                return;
+              }
 
-              // Proactively verify token refresh 45s before expiration so Firestore never hits a stale token
-              const expMs = Date.parse(tokenResult.expirationTime);
-              if (!Number.isNaN(expMs)) {
-                const msUntilCheck = Math.max(10_000, expMs - Date.now() - 45_000);
-                expiryTimer = window.setTimeout(() => {
-                  void (async () => {
-                    try {
-                      await nextUser.getIdToken(true);
-                    } catch (err) {
-                      const disabled = isTokenServiceDisabledError(err);
-                      await auth.signOut();
-                      if (!disposed) {
-                        setSessionNotice({
-                          sessionExpiredReset: true,
-                          tokenServiceDisabled: disabled,
-                          activationUrl: disabled
-                            ? 'https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=634918323270'
-                            : null,
-                        });
-                      }
-                    }
-                  })();
-                }, msUntilCheck);
+              await scheduleTokenRefresh(nextUser);
+              const loadedPrefs = LocalPrefsStore.load(nextUser.uid);
+              let resolvedName = UsernameAuth.getSavedUsername() || nextUser.displayName || '';
+              if (!resolvedName) {
+                try {
+                  resolvedName = (await CloudRepo.getCurrentUsername()) || '';
+                } catch {
+                  // Offline or transient; keep empty fallback
+                }
+              }
+
+              if (!disposed) {
+                setSessionNotice(null);
+                setUser(nextUser);
+                setVaultKey(cachedKey);
+                setPrefs(loadedPrefs);
+                setUsername(resolvedName);
               }
             } catch (err) {
               const disabled = isTokenServiceDisabledError(err);
-              await auth.signOut();
+              await UsernameAuth.signOut();
               if (!disposed) {
                 setUser(null);
                 setPrefs(null);
@@ -139,9 +176,7 @@ export default function App() {
                 setSessionNotice({
                   sessionExpiredReset: true,
                   tokenServiceDisabled: disabled,
-                  activationUrl: disabled
-                    ? 'https://console.developers.google.com/apis/api/securetoken.googleapis.com/overview?project=634918323270'
-                    : null,
+                  activationUrl: null,
                 });
               }
             }
@@ -167,23 +202,22 @@ export default function App() {
     };
   }, []);
 
-  const handlePrimaryExportAction = async () => {
-    if (!user || !vaultKey || !prefs) return;
-    if (selectedDevice) {
-      setExportDevice(selectedDevice);
-      return;
-    }
-    try {
-      const list = await CloudRepo.listDevices();
-      if (list.length > 0) {
-        setExportDevice(list[0]);
-      } else {
-        setSection('backup');
-      }
-    } catch {
-      setSection('devices');
-    }
+  const handleAuthenticated = (session: AuthSessionResult) => {
+    setSessionNotice(null);
+    setUser(session.user);
+    setVaultKey(session.vaultKey);
+    setPrefs(session.prefs);
+    setUsername(session.username);
+    setSelectedDevice(null);
+    setExportDevice(null);
+    setSection('devices');
   };
+
+  const handleSignOut = async () => {
+    await UsernameAuth.signOut();
+  };
+
+  const isAuthenticated = Boolean(user && vaultKey && prefs);
 
   return (
     <AppErrorBoundary>
@@ -195,7 +229,7 @@ export default function App() {
             href="#top"
             onClick={(e) => {
               e.preventDefault();
-              if (user && vaultKey) setSection('devices');
+              if (isAuthenticated) setSection('devices');
             }}
             className="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
           >
@@ -203,7 +237,7 @@ export default function App() {
           </a>
 
           {/* Zone 2: 4 concise single-line text navigation links */}
-          {user && vaultKey ? (
+          {isAuthenticated ? (
             <nav
               aria-label="التنقل الرئيسي"
               className="hidden md:flex items-center gap-6 text-sm font-semibold text-slate-600"
@@ -264,13 +298,13 @@ export default function App() {
 
           {/* Zone 3: 1 primary action */}
           <div className="flex items-center shrink-0">
-            {user && vaultKey ? (
+            {isAuthenticated ? (
               <button
                 type="button"
-                onClick={() => void handlePrimaryExportAction()}
-                className="rounded-lg bg-[#1F3A5F] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#162a47] whitespace-nowrap shrink-0"
+                onClick={() => void handleSignOut()}
+                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
               >
-                تنزيل نسخة احتياطية
+                تسجيل الخروج
               </button>
             ) : (
               <span className="font-mono text-xs font-semibold text-slate-600 whitespace-nowrap shrink-0">
@@ -280,8 +314,8 @@ export default function App() {
           </div>
         </header>
 
-        {/* Mobile section switcher below header (respects <= 15% mobile sticky cap by staying non-sticky) */}
-        {user && vaultKey && (
+        {/* Mobile section switcher below header (non-sticky to respect <= 15% mobile sticky cap) */}
+        {isAuthenticated && (
           <div className="border-b border-slate-200 bg-white px-4 py-2 md:hidden">
             <div className="flex items-center gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">
               {(
@@ -309,18 +343,17 @@ export default function App() {
 
         <main className="flex-1">
           {!authReady ? (
-            <div className="mx-auto max-w-6xl px-6 py-16">
-              <div className="h-6 w-56 rounded bg-slate-200" />
-              <div className="mt-4 h-4 w-96 max-w-full rounded bg-slate-100" />
+            <div className="mx-auto max-w-md px-6 py-20">
+              <div className="rounded-xl border border-slate-200 bg-white p-8">
+                <div className="h-6 w-36 rounded bg-slate-200" />
+                <div className="mt-5 h-10 w-full rounded-lg bg-slate-100" />
+                <div className="mt-4 h-10 w-full rounded-lg bg-slate-100" />
+              </div>
             </div>
-          ) : !user ? (
-            <SignInLanding sessionNotice={sessionNotice} />
-          ) : !vaultKey && prefs ? (
-            <VaultPassphraseGate
-              user={user}
-              prefs={prefs}
-              onUpdatePrefs={setPrefs}
-              onUnlocked={(key) => setVaultKey(key)}
+          ) : !isAuthenticated ? (
+            <UsernameAuthGate
+              onAuthenticated={handleAuthenticated}
+              sessionNotice={sessionNotice}
             />
           ) : user && vaultKey && prefs ? (
             <div className="mx-auto max-w-6xl px-6 py-8">
@@ -360,8 +393,8 @@ export default function App() {
               {section === 'security' && (
                 <SecurityAndAccountView
                   user={user}
+                  username={username}
                   prefs={prefs}
-                  onLockVault={() => setVaultKey(null)}
                   onCloudChanged={() => setCloudRefreshCounter((c) => c + 1)}
                 />
               )}
@@ -371,8 +404,8 @@ export default function App() {
 
         <footer className="border-t border-slate-200 bg-white px-6 py-4 text-xs text-slate-500">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4">
-            <span>نسخي الاحتياطي والعارض المشفّر — تشفير طرفي كامل قبل مغادرة الجهاز</span>
-            <span>عبارة المرور لا تُستعاد إن فُقدت؛ احفظها في مكان آمن</span>
+            <span>نسخي الاحتياطي والعارض المشفّر — حساب موحّد بين التطبيقين وتشفير طرفي كامل</span>
+            <span>احتفظ باسم المستخدم وكلمة المرور في مكان آمن</span>
           </div>
         </footer>
 

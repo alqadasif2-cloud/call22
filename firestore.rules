@@ -17,10 +17,6 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
-    function isVerifiedOwner(uid) {
-      return isOwner(uid) && request.auth.token.email_verified == true;
-    }
-
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -37,6 +33,46 @@ service cloud.firestore {
     function hasOwnedParentDevice(uid, deviceId) {
       return exists(/databases/$(database)/documents/users/$(uid)/devices/$(deviceId))
         && get(/databases/$(database)/documents/users/$(uid)/devices/$(deviceId)).data.ownerId == request.auth.uid;
+    }
+
+    // Validation Blueprint: UserProfile (/users/{uid})
+    function isValidUserProfile(data, uid) {
+      return data.keys().hasAll(['uid', 'username', 'usernameLower', 'usernameId', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'username', 'usernameLower', 'usernameId', 'createdAt'])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.uid == uid
+        && data.username is string
+        && data.username.size() >= 3
+        && data.username.size() <= 32
+        && data.username.matches('^[a-zA-Z0-9_.\\-\u0600-\u06FF]+$')
+        && data.usernameLower is string
+        && data.usernameLower.size() >= 3
+        && data.usernameLower.size() <= 32
+        && data.usernameLower.matches('^[a-z0-9_.\\-\u0600-\u06FF]+$')
+        && data.usernameId is string
+        && data.usernameId.size() == 40
+        && data.usernameId.matches('^[a-f0-9]+$')
+        && data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: UsernameClaim (/usernames/{usernameId})
+    function isValidUsernameClaim(data) {
+      return data.keys().hasAll(['uid', 'usernameLower', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'usernameLower', 'createdAt'])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.usernameLower is string
+        && data.usernameLower.size() >= 3
+        && data.usernameLower.size() <= 32
+        && data.usernameLower.matches('^[a-z0-9_.\\-\u0600-\u06FF]+$')
+        && data.createdAt is timestamp;
     }
 
     // Validation Blueprint: CryptoMeta (/users/{uid}/meta/crypto)
@@ -125,86 +161,122 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Cryptographic Root Metadata (Immutable after creation; no list queries permitted)
-    match /users/{uid}/meta/{metaId} {
-      allow get: if isOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
-      allow list: if false;
-      allow create: if isVerifiedOwner(uid)
-        && isValidId(uid)
-        && metaId == 'crypto'
-        && isValidCryptoMeta(incoming(), uid)
-        && incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isVerifiedOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
+    // Server-Only Password Hashes (Cloud Functions Admin SDK ONLY; zero client access)
+    match /authCredentials/{usernameId} {
+      allow read, write: if false;
     }
 
-    // Registered Backup Devices
-    match /users/{uid}/devices/{deviceId} {
-      allow get: if isOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
-      allow list: if isOwner(uid) && isValidId(uid) && existing().ownerId == request.auth.uid;
-      allow create: if isVerifiedOwner(uid)
-        && isValidId(uid)
-        && isValidId(deviceId)
-        && isValidDevice(incoming(), uid)
-        && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
-      allow update: if isVerifiedOwner(uid)
-        && isValidId(uid)
-        && isValidId(deviceId)
-        && isValidDevice(incoming(), uid)
-        && incoming().ownerId == existing().ownerId
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && (
-          // Action 1: Update device metadata / enabled categories
-          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'updatedAt'])
-          // Action 2: Mark device sync timestamp
-          || incoming().diff(existing()).affectedKeys().hasOnly(['lastSyncAt', 'updatedAt'])
-          // Action 3: Combined metadata and sync update
-          || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'lastSyncAt', 'updatedAt'])
-        );
-      allow delete: if isVerifiedOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
+    // Server-Only Brute-Force Rate Limit Counters (Cloud Functions Admin SDK ONLY; zero client access)
+    match /authRateLimits/{limitId} {
+      allow read, write: if false;
+    }
 
-      // Encrypted Records Subcollection (Protected by Master Gate + Query Enforcer)
-      match /records/{recId} {
-        allow get: if isOwner(uid)
+    // Global Username Uniqueness Lock (Write-once; unreadable by clients to prevent enumeration)
+    match /usernames/{usernameId} {
+      allow get: if false;
+      allow list: if false;
+      allow create: if isSignedIn()
+        && isValidId(usernameId)
+        && usernameId.size() == 40
+        && usernameId.matches('^[a-f0-9]+$')
+        && isValidUsernameClaim(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isSignedIn()
+        && isValidId(usernameId)
+        && resource != null
+        && existing().uid == request.auth.uid;
+    }
+
+    // Account Profile (/users/{uid})
+    match /users/{uid} {
+      allow get: if isOwner(uid) && isValidId(uid) && (resource == null || existing().uid == request.auth.uid);
+      allow list: if false;
+      allow create: if isOwner(uid)
+        && isValidId(uid)
+        && isValidUserProfile(incoming(), uid)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isOwner(uid) && isValidId(uid) && (resource == null || existing().uid == request.auth.uid);
+
+      // Cryptographic Root Metadata (Immutable after creation; no list queries permitted)
+      match /meta/{metaId} {
+        allow get: if isOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
+        allow list: if false;
+        allow create: if isOwner(uid)
+          && isValidId(uid)
+          && metaId == 'crypto'
+          && isValidCryptoMeta(incoming(), uid)
+          && incoming().createdAt == request.time;
+        allow update: if false;
+        allow delete: if isOwner(uid) && isValidId(uid) && metaId == 'crypto' && (resource == null || existing().uid == request.auth.uid);
+      }
+
+      // Registered Backup Devices
+      match /devices/{deviceId} {
+        allow get: if isOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isOwner(uid) && isValidId(uid) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(uid)
           && isValidId(uid)
           && isValidId(deviceId)
-          && isValidId(recId)
-          && (resource == null || existing().ownerId == request.auth.uid)
-          && hasOwnedParentDevice(uid, deviceId);
-        allow list: if isOwner(uid)
-          && isValidId(uid)
-          && isValidId(deviceId)
-          && existing().ownerId == request.auth.uid;
-        allow create: if isVerifiedOwner(uid)
-          && isValidId(uid)
-          && isValidId(deviceId)
-          && isValidId(recId)
-          && isValidRecord(incoming(), uid, deviceId)
+          && isValidDevice(incoming(), uid)
           && incoming().createdAt == request.time
-          && incoming().updatedAt == request.time
-          && hasOwnedParentDevice(uid, deviceId);
-        allow update: if isVerifiedOwner(uid)
+          && incoming().updatedAt == request.time;
+        allow update: if isOwner(uid)
           && isValidId(uid)
           && isValidId(deviceId)
-          && isValidId(recId)
-          && isValidRecord(incoming(), uid, deviceId)
+          && isValidDevice(incoming(), uid)
           && incoming().ownerId == existing().ownerId
-          && incoming().deviceId == existing().deviceId
-          && incoming().type == existing().type
-          && incoming().ts == existing().ts
-          && incoming().v == existing().v
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['iv', 'data', 'updatedAt'])
-          && hasOwnedParentDevice(uid, deviceId);
-        allow delete: if isVerifiedOwner(uid)
-          && isValidId(uid)
-          && isValidId(deviceId)
-          && isValidId(recId)
-          && (resource == null || existing().ownerId == request.auth.uid)
-          && hasOwnedParentDevice(uid, deviceId);
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['lastSyncAt', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'model', 'enabled', 'lastSyncAt', 'updatedAt'])
+          );
+        allow delete: if isOwner(uid) && isValidId(uid) && isValidId(deviceId) && (resource == null || existing().ownerId == request.auth.uid);
+
+        // Encrypted Records Subcollection (Protected by Master Gate + Query Enforcer)
+        match /records/{recId} {
+          allow get: if isOwner(uid)
+            && isValidId(uid)
+            && isValidId(deviceId)
+            && isValidId(recId)
+            && (resource == null || existing().ownerId == request.auth.uid)
+            && hasOwnedParentDevice(uid, deviceId);
+          allow list: if isOwner(uid)
+            && isValidId(uid)
+            && isValidId(deviceId)
+            && existing().ownerId == request.auth.uid;
+          allow create: if isOwner(uid)
+            && isValidId(uid)
+            && isValidId(deviceId)
+            && isValidId(recId)
+            && isValidRecord(incoming(), uid, deviceId)
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time
+            && hasOwnedParentDevice(uid, deviceId);
+          allow update: if isOwner(uid)
+            && isValidId(uid)
+            && isValidId(deviceId)
+            && isValidId(recId)
+            && isValidRecord(incoming(), uid, deviceId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().deviceId == existing().deviceId
+            && incoming().type == existing().type
+            && incoming().ts == existing().ts
+            && incoming().v == existing().v
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['iv', 'data', 'updatedAt'])
+            && hasOwnedParentDevice(uid, deviceId);
+          allow delete: if isOwner(uid)
+            && isValidId(uid)
+            && isValidId(deviceId)
+            && isValidId(recId)
+            && (resource == null || existing().ownerId == request.auth.uid)
+            && hasOwnedParentDevice(uid, deviceId);
+        }
       }
     }
   }

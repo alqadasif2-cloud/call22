@@ -53,12 +53,12 @@ import app.backup.core.PlainRecord
 import app.backup.core.RecordCodec
 import app.backup.core.RecordType
 import app.backup.core.Session
+import app.backup.core.UsernameAuth
 import app.backup.core.ui.AuthGate
 import app.backup.core.ui.BackupTheme
 import app.backup.core.ui.ConfirmDialog
 import app.backup.core.ui.Loading
 import app.backup.core.ui.PasswordDialog
-import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -99,6 +99,7 @@ fun Root() {
 // ---------------------------------------------------------------- قائمة الأجهزة
 @Composable
 fun DevicesScreen(onOpen: (DeviceInfo) -> Unit, onExport: (DeviceInfo) -> Unit) {
+    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var devices by remember { mutableStateOf<List<DeviceInfo>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -112,12 +113,17 @@ fun DevicesScreen(onOpen: (DeviceInfo) -> Unit, onExport: (DeviceInfo) -> Unit) 
         try { devices = CloudRepo().listDevices() } catch (e: Exception) { error = AuthMessages.of(e) }
     }
 
+    val currentUsername = remember { UsernameAuth.savedUsername(ctx) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text("أجهزتي", style = MaterialTheme.typography.headlineSmall)
-        Text("الأجهزة المسجّلة ضمن حسابك فقط.", style = MaterialTheme.typography.bodySmall)
+        Text(
+            if (!currentUsername.isNullOrBlank()) "الحساب النشط: $currentUsername — الأجهزة المسجّلة ضمن حسابك فقط."
+            else "الأجهزة المسجّلة ضمن حسابك فقط.",
+            style = MaterialTheme.typography.bodySmall,
+        )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
             OutlinedButton(onClick = { reload++ }) { Text("تحديث") }
-            OutlinedButton(onClick = { FirebaseAuth.getInstance().signOut() }) { Text("تسجيل الخروج") }
+            OutlinedButton(onClick = { UsernameAuth.signOut(ctx) }) { Text("تسجيل الخروج") }
             OutlinedButton(onClick = { confirm = "account" }) { Text("حذف الحساب") }
         }
         message?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
@@ -161,7 +167,7 @@ fun DevicesScreen(onOpen: (DeviceInfo) -> Unit, onExport: (DeviceInfo) -> Unit) 
                 when (kind) {
                     "cloud" -> { repo.deleteRecords(target!!.id); message = "حُذفت النسخة السحابية للجهاز. الملفات المنزَّلة سابقًا لم تتأثر." }
                     "device" -> { repo.deleteDevice(target!!.id); message = "أُزيل الجهاز من الحساب مع بياناته السحابية." }
-                    "account" -> { repo.deleteAccount(password!!) }
+                    "account" -> { repo.deleteAccount(password!!); UsernameAuth.signOut(ctx) }
                 }
                 if (kind != "account") reload++
             } catch (e: Exception) { message = AuthMessages.of(e) }

@@ -32,6 +32,8 @@ jobs:
         with: { distribution: temurin, java-version: 17 }
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - name: Test Custom Auth Cloud Function logic (scrypt + rate limit)
+        run: node --test firebase/functions/authCore.test.js
       - name: Install
         run: npm install --prefix firebase/rules-test
       - name: Run rules tests

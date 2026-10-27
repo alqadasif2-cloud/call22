@@ -121,3 +121,11 @@ export interface ExportOutcome {
   verifiedHashes: Record<string, string>;
   warning?: string;
 }
+
+export interface NormalizedUsername {
+  username: string;
+  usernameLower: string;
+  usernameId: string;
+  syntheticEmail: string;
+}
+

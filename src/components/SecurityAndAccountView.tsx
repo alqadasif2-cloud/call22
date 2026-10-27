@@ -1,27 +1,27 @@
-import React, { useState } from 'react';
-import { GoogleAuthProvider, reauthenticateWithPopup, signOut, User } from 'firebase/auth';
+import React, { useEffect, useState } from 'react';
+import { User } from 'firebase/auth';
 import {
   CheckCircle2,
-  Copy,
-  Lock,
   LogOut,
   RotateCcw,
   Server,
   Shield,
   Smartphone,
   Trash2,
+  X,
 } from 'lucide-react';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { CloudRepo, LiveCloudCheckResult } from '../core/cloudRepo';
 import { KeyVault, PBKDF2_ITERATIONS } from '../core/crypto';
-import { auth, friendlyErrorMessageAr, googleProvider } from '../core/firebase';
+import { friendlyErrorMessageAr } from '../core/firebase';
 import { LocalDevicePrefs, LocalPrefsStore, LocalQueueDb } from '../core/localQueue';
+import { UsernameAuth } from '../core/usernameAuth';
 import { ConfirmModal } from './Dialogs';
 
 interface SecurityAndAccountViewProps {
   user: User;
+  username: string;
   prefs: LocalDevicePrefs;
-  onLockVault: () => void;
   onCloudChanged: () => void;
 }
 
@@ -29,53 +29,38 @@ type ConfirmKind = 'cloud' | 'local' | 'device' | 'account' | null;
 
 export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
   user,
+  username,
   prefs,
-  onLockVault,
   onCloudChanged,
 }) => {
   const [confirmKind, setConfirmKind] = useState<ConfirmKind>(null);
+  const [accountPassword, setAccountPassword] = useState('');
+  const [resolvedUsername, setResolvedUsername] = useState<string>(
+    username || UsernameAuth.getSavedUsername() || user.displayName || ''
+  );
   const [busy, setBusy] = useState(false);
   const [checkingServer, setCheckingServer] = useState(false);
   const [serverCheck, setServerCheck] = useState<LiveCloudCheckResult | null>(null);
-  const [pairingToken, setPairingToken] = useState<string | null>(null);
-  const [pairingBusy, setPairingBusy] = useState(false);
-  const [pairingCopied, setPairingCopied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const handleGenerateAndroidPairingToken = async () => {
-    setPairingBusy(true);
-    setError(null);
-    setPairingCopied(false);
-    try {
-      const res = await reauthenticateWithPopup(user, googleProvider);
-      const cred = GoogleAuthProvider.credentialFromResult(res);
-      if (!cred?.idToken) {
-        throw new Error('تعذّر استخراج رمز الربط من جلسة Google.');
-      }
-      setPairingToken(cred.idToken);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
       try {
-        await navigator.clipboard.writeText(cred.idToken);
-        setPairingCopied(true);
+        const fetched = await CloudRepo.getCurrentUsername();
+        if (!cancelled && fetched) {
+          setResolvedUsername(fetched);
+          UsernameAuth.saveUsername(fetched);
+        }
       } catch {
-        // User can tap copy button manually if browser blocks automatic clipboard write after popup
+        // Keep cached username
       }
-    } catch (err) {
-      setError(friendlyErrorMessageAr(err));
-    } finally {
-      setPairingBusy(false);
-    }
-  };
-
-  const handleCopyPairingToken = async () => {
-    if (!pairingToken) return;
-    try {
-      await navigator.clipboard.writeText(pairingToken);
-      setPairingCopied(true);
-    } catch {
-      setError('تعذّر النسخ التلقائي إلى الحافظة.');
-    }
-  };
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user.uid]);
 
   const handleVerifyLiveServer = async () => {
     setCheckingServer(true);
@@ -106,14 +91,8 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
     }
   };
 
-  const handleLockNow = async () => {
-    await KeyVault.clear(user.uid);
-    onLockVault();
-  };
-
   const handleSignOut = async () => {
-    await KeyVault.clear(user.uid);
-    await signOut(auth);
+    await UsernameAuth.signOut();
   };
 
   const handleExecuteConfirmedAction = async () => {
@@ -139,15 +118,18 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
         }
         case 'device': {
           await CloudRepo.deleteDevice(prefs.deviceId);
-          await KeyVault.clear(user.uid);
-          await signOut(auth);
+          await UsernameAuth.signOut();
           return;
         }
         case 'account': {
-          await CloudRepo.deleteAccountAndVault();
+          await CloudRepo.deleteAccountAndVault(
+            accountPassword,
+            UsernameAuth.deleteCustomAuthAccountIfConfigured
+          );
           await LocalQueueDb.deleteAllForUser(user.uid);
           LocalPrefsStore.clear(user.uid);
           await KeyVault.clear(user.uid);
+          setAccountPassword('');
           return;
         }
       }
@@ -163,10 +145,9 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
     <div className="space-y-8">
       <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-5">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">الأمان والتحكم في البيانات</h1>
+          <h1 className="text-2xl font-bold text-slate-900">الأمان والحساب</h1>
           <p className="mt-1 text-sm text-slate-600">
-            تحقق مباشر من الخادم السحابي الفعلي، قفل الجلسة، والتحكم الدقيق في البيانات المحلية
-            والسحابية.
+            إدارة الجلسة، التحقق المباشر من الخادم السحابي، والتحكم في البيانات المحلية والسحابية.
           </p>
         </div>
 
@@ -177,7 +158,7 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
           className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
         >
           <Server className="h-3.5 w-3.5 text-[#1F3A5F]" />
-          <span>{checkingServer ? 'جاري التحقق من الخادم...' : 'فحص الاتصال الفعلي بـ Firestore'}</span>
+          <span>{checkingServer ? 'جارٍ التحقق من الخادم...' : 'فحص الاتصال بقاعدة البيانات'}</span>
         </button>
       </div>
 
@@ -186,20 +167,20 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
           <div className="flex items-center gap-2 font-semibold text-emerald-800">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
             <span>
-              اتصال سحابي حي ومؤكّد بقاعدة بيانات Google Cloud Firestore (زمن استجابة الخادم المباشر:{' '}
+              اتصال سحابي حي ومؤكّد بقاعدة بيانات Firestore (زمن الاستجابة:{' '}
               <span className="font-mono tabular-nums">{serverCheck.latencyMs}ms</span>)
             </span>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-emerald-900">
             <span>
-              معرّف المشروع السحابي:{' '}
+              معرّف المشروع:{' '}
               <strong dir="ltr" className="font-mono">
                 {firebaseConfig.projectId}
               </strong>
             </span>
             <span aria-hidden="true">·</span>
             <span>
-              حالة وثيقة التشفير الجذرية (<span className="font-mono">meta/crypto</span>):{' '}
+              حالة وثيقة التشفير (<span className="font-mono">meta/crypto</span>):{' '}
               <strong>{serverCheck.hasCryptoDoc ? 'محفوظة وموثّقة على الخادم' : 'غير منشأة'}</strong>
             </span>
           </div>
@@ -222,20 +203,20 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
         <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-6">
           <div className="flex items-center gap-2.5">
             <Shield className="h-5 w-5 text-[#1F3A5F]" />
-            <h2 className="text-base font-bold text-slate-900">مواصفات الخزنة والحساب الفعلي</h2>
+            <h2 className="text-base font-bold text-slate-900">بيانات الحساب والتشفير</h2>
           </div>
 
           <div className="mt-4 divide-y divide-slate-100 text-sm">
             <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">البريد الإلكتروني الموثّق</span>
-              <span dir="ltr" className="font-mono text-xs text-slate-900">
-                {user.email || user.uid}
+              <span className="text-slate-600">اسم المستخدم</span>
+              <span dir="ltr" className="font-mono text-xs font-semibold text-slate-900">
+                {resolvedUsername || '—'}
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">مشروع Firebase الفعلي</span>
-              <span dir="ltr" className="font-mono text-xs font-semibold text-slate-900">
-                {firebaseConfig.projectId}
+              <span className="text-slate-600">معرّف الحساب الفريد (UID)</span>
+              <span dir="ltr" className="font-mono text-xs text-slate-900">
+                {user.uid}
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">
@@ -245,87 +226,37 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">خوارزمية التشفير</span>
+              <span className="text-slate-600">خوارزمية التشفير الطرفي</span>
               <span className="font-mono text-xs font-semibold text-slate-900">
-                AES-256-GCM + AAD (128-bit Tag)
+                AES-256-GCM + AAD
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">اشتقاق المفتاح</span>
+              <span className="text-slate-600">اشتقاق المفتاح على الجهاز</span>
               <span className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
                 PBKDF2-SHA256 ({PBKDF2_ITERATIONS.toLocaleString('en-US')} iter)
               </span>
             </div>
-            <div className="flex items-center justify-between py-2.5">
-              <span className="text-slate-600">منع التكرار والتحقق</span>
-              <span className="font-mono text-xs font-semibold text-slate-900">
-                SHA-256 Deterministic ID
-              </span>
-            </div>
           </div>
 
-          <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50/70 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-xs font-bold text-slate-900">
-                <Smartphone className="h-4 w-4 text-[#1F3A5F]" />
-                <span>ربط تطبيقي الهاتف (APK) بنفس الخزنة السحابية</span>
-              </div>
-              <button
-                type="button"
-                disabled={pairingBusy}
-                onClick={() => void handleGenerateAndroidPairingToken()}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap shrink-0"
-              >
-                <span>{pairingBusy ? 'جاري الإصدار...' : 'إصدار رمز ربط تطبيق الهاتف'}</span>
-              </button>
+          <div className="mt-5 border-t border-slate-100 pt-4">
+            <div className="flex items-center gap-2 text-xs font-bold text-slate-900">
+              <Smartphone className="h-4 w-4 text-[#1F3A5F]" />
+              <span>حساب موحّد بين التطبيقين (backup-app و viewer-app)</span>
             </div>
             <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
-              لتسجيل الدخول في ملفي الأندرويد (<span className="font-mono">backup-app</span> و
-              <span className="font-mono">viewer-app</span>) بنفس حسابك دون أي إعدادات، أصدر رمز الربط هنا ثم اضغط «لصق رمز الربط من الحافظة والدخول» داخل تطبيق الهاتف.
+              سجّل الدخول باستخدام اسم المستخدم وكلمة المرور نفسيهما في تطبيق النسخ الاحتياطي (
+              <span className="font-mono">backup-app</span>) وتطبيق العارض (
+              <span className="font-mono">viewer-app</span>) للوصول مباشرةً إلى نسخك الاحتياطية
+              المشفّرة وتنزيلها.
             </p>
-            {pairingToken && (
-              <div className="mt-3 flex items-center gap-2">
-                <input
-                  type="text"
-                  readOnly
-                  dir="ltr"
-                  value={pairingToken}
-                  className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-700"
-                />
-                <button
-                  type="button"
-                  onClick={() => void handleCopyPairingToken()}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-[#1F3A5F] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#162a47] whitespace-nowrap shrink-0"
-                >
-                  {pairingCopied ? (
-                    <>
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                      <span>تم النسخ</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3.5 w-3.5" />
-                      <span>نسخ الرمز</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            )}
           </div>
 
           <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
             <button
               type="button"
-              onClick={() => void handleLockNow()}
-              className="inline-flex items-center gap-2 rounded-lg bg-[#1F3A5F] px-4 py-2 text-xs font-semibold text-white hover:bg-[#162a47] whitespace-nowrap shrink-0"
-            >
-              <Lock className="h-3.5 w-3.5" />
-              <span>قفل الخزنة ومسح المفتاح من الذاكرة</span>
-            </button>
-            <button
-              type="button"
               onClick={() => void handleSignOut()}
-              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-2 rounded-lg bg-[#1F3A5F] px-4 py-2 text-xs font-semibold text-white hover:bg-[#162a47] whitespace-nowrap shrink-0"
             >
               <LogOut className="h-3.5 w-3.5" />
               <span>تسجيل الخروج</span>
@@ -384,7 +315,10 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
             <button
               type="button"
               disabled={busy}
-              onClick={() => setConfirmKind('account')}
+              onClick={() => {
+                setAccountPassword('');
+                setConfirmKind('account');
+              }}
               className="flex w-full items-center justify-between rounded-lg border border-red-200 bg-red-50/40 px-4 py-2.5 text-right text-xs font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
             >
               <span>حذف الحساب وكل النسخ الاحتياطية في السحابة نهائيًا</span>
@@ -431,15 +365,62 @@ export const SecurityAndAccountView: React.FC<SecurityAndAccountViewProps> = ({
       )}
 
       {confirmKind === 'account' && (
-        <ConfirmModal
-          title="حذف الحساب وكل بياناته نهائيًا"
-          description="سيُطلب تأكيد هويتك عبر نافذة Google، ثم تُحذف جميع أجهزتك ونسخك الاحتياطية ومفتاح التحقق وحسابك نهائيًا من السحابة. الملفات التي نزّلتها سابقًا إلى ذاكرة جهازك لن تُحذف."
-          confirmLabel="تأكيد الهوية وحذف الحساب"
-          danger
-          busy={busy}
-          onConfirm={() => void handleExecuteConfirmedAction()}
-          onClose={() => setConfirmKind(null)}
-        />
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6">
+            <div className="flex items-start justify-between gap-4">
+              <h3 className="text-lg font-bold text-slate-900">حذف الحساب وكل بياناته نهائيًا</h3>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirmKind(null)}
+                className="rounded-lg p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+                aria-label="إغلاق"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-3 text-sm leading-relaxed text-slate-600">
+              أدخل كلمة مرور حسابك لتأكيد حذف جميع أجهزتك ونسخك الاحتياطية وحسابك نهائيًا من
+              السحابة. الملفات التي نزّلتها سابقًا إلى ذاكرة جهازك لن تُحذف.
+            </p>
+            <div className="mt-4">
+              <label htmlFor="delete-account-pw" className="block text-xs font-semibold text-slate-700">
+                كلمة المرور
+              </label>
+              <input
+                id="delete-account-pw"
+                type="password"
+                dir="ltr"
+                value={accountPassword}
+                onChange={(e) => setAccountPassword(e.target.value)}
+                disabled={busy}
+                className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2 text-left text-sm text-slate-900 focus:border-[#1F3A5F] focus:outline-none"
+              />
+            </div>
+            <div className="mt-6 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirmKind(null)}
+                className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                disabled={busy || accountPassword.trim().length === 0}
+                onClick={() => void handleExecuteConfirmedAction()}
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-50 whitespace-nowrap shrink-0"
+              >
+                {busy ? 'جارٍ الحذف...' : 'تأكيد الحذف'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

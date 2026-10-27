@@ -1,5 +1,5 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signOut } from 'firebase/auth';
+import { getAuth, signOut } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { getPrebootSessionState, SessionBootstrapState } from './prebootAuthGuard';
@@ -11,14 +11,20 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 
-export const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
-
 export function isTokenServiceDisabledError(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return (
     msg.includes('token-service-api-has-not-been-used') ||
     msg.includes('securetoken.googleapis.com')
+  );
+}
+
+export function isAuthProviderNotEnabledError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('auth/operation-not-allowed') ||
+    msg.includes('admin_only_operation') ||
+    msg.includes('operation_not_allowed')
   );
 }
 
@@ -111,8 +117,12 @@ export function handleFirestoreError(
 export function friendlyErrorMessageAr(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
 
+  if (isAuthProviderNotEnabledError(err)) {
+    return 'طريقة المصادقة بكلمة المرور غير مفعّلة بعد في مشروع Firebase. فعّل خيار Email/Password من لوحة تحكم Firebase (Authentication ← Sign-in method) ثم أعد المحاولة.';
+  }
+
   if (isTokenServiceDisabledError(err)) {
-    return 'انتهت صلاحية رمز الجلسة بعد مرور ساعة وتعذّر التجديد التلقائي لأن خدمة Token Service API غير مفعّلة في مشروع Google Cloud. سجّل الدخول مجددًا بحساب Google للمتابعة فورًا.';
+    return 'انتهت صلاحية الجلسة السابقة. يرجى تسجيل الدخول باسم المستخدم وكلمة المرور للمتابعة.';
   }
 
   if (raw.includes('Quota exceeded')) {
@@ -123,36 +133,48 @@ export function friendlyErrorMessageAr(err: unknown): string {
     try {
       const parsed = JSON.parse(raw) as FirestoreErrorInfo;
       if (isTokenServiceDisabledError(parsed.error)) {
-        return 'انتهت صلاحية الجلسة السحابية؛ يرجى تسجيل الدخول مجددًا بحساب Google لتجديد الرمز فورًا.';
+        return 'انتهت صلاحية الجلسة السحابية؛ يرجى تسجيل الدخول مجددًا.';
       }
       if (parsed.error.includes('Quota exceeded')) {
         return 'تم تجاوز حصة الاستخدام اليومية المجانية لقاعدة البيانات السحابية.';
       }
       if (parsed.error.includes('Missing or insufficient permissions')) {
-        return 'رفضت قواعد الأمان السحابية هذه العملية. تأكد من توثيق البريد الإلكتروني وصلاحية الجلسة.';
+        return 'رفضت قواعد الأمان السحابية هذه العملية. تأكد من صلاحية الجلسة وأن البيانات تتبع لحسابك.';
       }
       if (parsed.error.includes('offline') || parsed.error.includes('unavailable')) {
-        return 'تعذّر الوصول إلى الخادم السحابي حاليًا. إذا مضت ساعة على تسجيل دخولك، بدّل الحساب أو سجّل الدخول مجددًا لتجديد الجلسة.';
+        return 'تعذّر الوصول إلى الخادم السحابي حاليًا. تحقق من اتصال الإنترنت وأعد المحاولة.';
       }
     } catch {
       // Fall through
     }
   }
 
-  if (raw.includes('auth/popup-closed-by-user')) {
-    return 'تم إغلاق نافذة تسجيل الدخول قبل إتمام المصادقة.';
+  if (raw.includes('auth/email-already-in-use') || raw.includes('username-already-in-use')) {
+    return 'اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر.';
   }
-  if (raw.includes('auth/popup-blocked')) {
-    return 'حجب المتصفح نافذة تسجيل الدخول المنبثقة. يرجى السماح بالنوافذ المنبثقة لهذا الموقع.';
+  if (
+    raw.includes('auth/invalid-credential') ||
+    raw.includes('auth/wrong-password') ||
+    raw.includes('auth/user-not-found') ||
+    raw.includes('auth/invalid-login-credentials') ||
+    raw.includes('invalid-credentials')
+  ) {
+    return 'اسم المستخدم أو كلمة المرور غير صحيحة.';
+  }
+  if (raw.includes('auth/weak-password')) {
+    return 'يجب أن تتكون كلمة المرور من 8 أحرف على الأقل.';
+  }
+  if (raw.includes('auth/too-many-requests') || raw.includes('too-many-requests')) {
+    return 'تم إيقاف المحاولات مؤقتًا لكثرة المحاولات الخاطئة. يرجى الانتظار قليلًا ثم المحاولة مجددًا.';
   }
   if (raw.includes('auth/network-request-failed')) {
-    return 'تعذّر الاتصال بالشبكة أثناء المصادقة. تحقق من اتصال الإنترنت.';
+    return 'لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة.';
   }
   if (raw.includes('auth/requires-recent-login')) {
     return 'يلزم تأكيد تسجيل دخول حديث لإتمام حذف الحساب.';
   }
 
-  return raw.length <= 160 && /[\u0600-\u06FF]/.test(raw)
+  return raw.length <= 180 && /[\u0600-\u06FF]/.test(raw)
     ? raw
     : 'تعذّر إتمام العملية السحابية. تحقق من الاتصال وأعد المحاولة.';
 }

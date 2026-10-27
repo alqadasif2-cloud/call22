@@ -1,4 +1,4 @@
-import { deleteUser, reauthenticateWithPopup } from 'firebase/auth';
+import { deleteUser, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
@@ -26,8 +26,8 @@ import {
   randomBytes,
   unb64,
 } from './crypto';
-import { auth, db, googleProvider, handleFirestoreError } from './firebase';
-import { DeviceInfo, EncRecord, OperationType, RecordType } from './types';
+import { auth, db, handleFirestoreError } from './firebase';
+import { DeviceInfo, EncRecord, NormalizedUsername, OperationType, RecordType } from './types';
 
 /**
  * Volumetric & Pattern Constants synced verbatim with firebase-blueprint.json & firestore.rules
@@ -35,6 +35,9 @@ import { DeviceInfo, EncRecord, OperationType, RecordType } from './types';
 export const BLUEPRINT_LIMITS = {
   ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
   ID_MAX_LEN: 128,
+  USERNAME_PATTERN: /^[a-zA-Z0-9_.\-\u0600-\u06FF]+$/,
+  USERNAME_MIN_LEN: 3,
+  USERNAME_MAX_LEN: 32,
   DEVICE_NAME_MAX_LEN: 100,
   DEVICE_MODEL_MAX_LEN: 100,
   CIPHERTEXT_MAX_LEN: 500_000,
@@ -63,6 +66,80 @@ export interface LiveCloudCheckResult {
 }
 
 export const CloudRepo = {
+  // ---------------- Account Profile & Username Claim (/users/{uid} & /usernames/{usernameId}) ----------------
+
+  async getCurrentUsername(): Promise<string | null> {
+    const uid = requireUid();
+    const path = `users/${uid}`;
+    try {
+      const snap = await getDoc(doc(db, 'users', uid));
+      if (snap.exists() && typeof snap.data().username === 'string') {
+        return snap.data().username as string;
+      }
+      return auth.currentUser?.displayName || null;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, path);
+    }
+  },
+
+  async ensureUserProfile(norm: NormalizedUsername, isNewRegistration: boolean): Promise<void> {
+    const uid = requireUid();
+    const userPath = `users/${uid}`;
+    let existingUser;
+    try {
+      existingUser = await getDoc(doc(db, 'users', uid));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, userPath);
+    }
+    if (existingUser.exists()) return;
+
+    const claimPath = `usernames/${norm.usernameId}`;
+    if (isNewRegistration) {
+      try {
+        await setDoc(doc(db, 'usernames', norm.usernameId), {
+          uid,
+          usernameLower: norm.usernameLower,
+          createdAt: serverTimestamp(),
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes('Missing or insufficient permissions') || msg.includes('permission-denied')) {
+          if (auth.currentUser) {
+            try {
+              await deleteUser(auth.currentUser);
+            } catch {
+              // Best-effort cleanup
+            }
+          }
+          throw new Error('اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر.');
+        }
+        handleFirestoreError(error, OperationType.CREATE, claimPath);
+      }
+    } else {
+      try {
+        await setDoc(doc(db, 'usernames', norm.usernameId), {
+          uid,
+          usernameLower: norm.usernameLower,
+          createdAt: serverTimestamp(),
+        });
+      } catch {
+        // Already claimed on registration
+      }
+    }
+
+    try {
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        username: norm.username,
+        usernameLower: norm.usernameLower,
+        usernameId: norm.usernameId,
+        createdAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, userPath);
+    }
+  },
+
   // ---------------- Cryptographic Root (/users/{uid}/meta/crypto) ----------------
 
   async hasCrypto(): Promise<boolean> {
@@ -472,12 +549,35 @@ export const CloudRepo = {
     }
   },
 
-  async deleteAccountAndVault(): Promise<void> {
+  async deleteAccountAndVault(
+    password: string,
+    customDeleteFn?: (pw: string) => Promise<boolean>
+  ): Promise<void> {
     const user = auth.currentUser;
     if (!user) throw new Error('يلزم تسجيل الدخول أولًا.');
+    const trimmed = password.trim();
+    if (!trimmed) throw new Error('يرجى إدخال كلمة المرور لتأكيد حذف الحساب.');
     const uid = user.uid;
 
-    await reauthenticateWithPopup(user, googleProvider);
+    if (user.email && user.providerData.some((p) => p.providerId === 'password')) {
+      const cred = EmailAuthProvider.credential(user.email, trimmed);
+      await reauthenticateWithCredential(user, cred);
+    } else if (await CloudRepo.hasCrypto()) {
+      const verified = await CloudRepo.unlock(trimmed);
+      if (!verified) {
+        throw new Error('كلمة المرور غير صحيحة.');
+      }
+    }
+
+    let claimedUsernameId: string | null = null;
+    try {
+      const profileSnap = await getDoc(doc(db, 'users', uid));
+      if (profileSnap.exists() && typeof profileSnap.data().usernameId === 'string') {
+        claimedUsernameId = profileSnap.data().usernameId as string;
+      }
+    } catch {
+      // Proceed with deletion
+    }
 
     const devices = await CloudRepo.listDevices();
     for (const dev of devices) {
@@ -491,6 +591,21 @@ export const CloudRepo = {
       handleFirestoreError(error, OperationType.DELETE, cryptoPath);
     }
 
-    await deleteUser(user);
+    const deletedByCustomFn = customDeleteFn ? await customDeleteFn(trimmed) : false;
+    if (!deletedByCustomFn) {
+      if (claimedUsernameId) {
+        try {
+          await deleteDoc(doc(db, 'usernames', claimedUsernameId));
+        } catch {
+          // Best-effort release
+        }
+      }
+      try {
+        await deleteDoc(doc(db, 'users', uid));
+      } catch {
+        // Best-effort profile cleanup
+      }
+      await deleteUser(user);
+    }
   },
 };

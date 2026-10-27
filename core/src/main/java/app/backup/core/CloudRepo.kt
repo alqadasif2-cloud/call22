@@ -4,6 +4,7 @@ import android.content.Context
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseNetworkException
 import com.google.firebase.FirebaseOptions
+import com.google.firebase.FirebaseTooManyRequestsException
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
@@ -11,7 +12,6 @@ import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.FirebaseAuthWeakPasswordException
-import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
@@ -66,14 +66,25 @@ object CloudInit {
 }
 
 object AuthMessages {
-    fun of(e: Throwable): String = when (e) {
-        is FirebaseAuthInvalidCredentialsException, is FirebaseAuthInvalidUserException -> "بيانات التحقق أو رمز الربط غير صالح أو منتهي الصلاحية"
-        is FirebaseAuthUserCollisionException -> "هذا البريد مسجّل مسبقًا"
-        is FirebaseAuthWeakPasswordException -> "كلمة المرور ضعيفة"
-        is FirebaseAuthRecentLoginRequiredException -> "يلزم تسجيل دخول حديث. سجّل الخروج ثم الدخول وأعد المحاولة"
-        is FirebaseNetworkException -> "لا يوجد اتصال بالإنترنت"
-        is FirebaseFirestoreException -> "تعذّرت العملية السحابية (${e.code.name})"
-        else -> "تعذّر إتمام العملية (${e.javaClass.simpleName})"
+    fun of(e: Throwable): String {
+        val raw = e.message.orEmpty()
+        return when {
+            e is UsernameAuthException -> raw.ifBlank { "تعذّر إتمام المصادقة." }
+            e is FirebaseAuthUserCollisionException -> "اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر."
+            e is FirebaseAuthInvalidCredentialsException || e is FirebaseAuthInvalidUserException ->
+                "اسم المستخدم أو كلمة المرور غير صحيحة."
+            e is FirebaseAuthWeakPasswordException -> "يجب أن تتكون كلمة المرور من 8 أحرف على الأقل."
+            e is FirebaseTooManyRequestsException ->
+                "تم إيقاف المحاولات مؤقتًا لكثرة المحاولات الخاطئة. يرجى الانتظار قليلًا ثم المحاولة مجددًا."
+            e is FirebaseAuthRecentLoginRequiredException ->
+                "يلزم تسجيل دخول حديث. سجّل الخروج ثم الدخول وأعد المحاولة."
+            e is FirebaseNetworkException -> "لا يوجد اتصال بالإنترنت. تحقق من الشبكة وأعد المحاولة."
+            raw.contains("ADMIN_ONLY_OPERATION", ignoreCase = true) ||
+                raw.contains("OPERATION_NOT_ALLOWED", ignoreCase = true) ->
+                "يرجى تفعيل طريقة الدخول Email/Password في لوحة تحكم Firebase (Authentication ← Sign-in method) لهذا المشروع."
+            e is FirebaseFirestoreException -> "تعذّرت العملية السحابية (${e.code.name})"
+            else -> "تعذّر إتمام العملية (${e.javaClass.simpleName})"
+        }
     }
 }
 
@@ -85,9 +96,59 @@ class CloudRepo(
 ) {
     private val uid: String get() = auth.currentUser?.uid ?: throw IllegalStateException("not signed in")
     private fun user() = db.collection("users").document(uid)
+    private fun usernameDoc(usernameId: String) = db.collection("usernames").document(usernameId)
     private fun cryptoDoc() = user().collection("meta").document("crypto")
     private fun devices() = user().collection("devices")
     private fun records(deviceId: String) = devices().document(deviceId).collection("records")
+
+    // ---------- ملف الحساب واسم المستخدم ----------
+    suspend fun getCurrentUsername(): String? {
+        val snap = user().get().await()
+        return if (snap.exists()) snap.getString("username") else auth.currentUser?.displayName
+    }
+
+    suspend fun ensureUserProfile(norm: NormalizedUsername, isNewRegistration: Boolean) {
+        val existing = user().get().await()
+        if (existing.exists()) return
+
+        if (isNewRegistration) {
+            try {
+                usernameDoc(norm.usernameId).set(
+                    mapOf(
+                        "uid" to uid,
+                        "usernameLower" to norm.usernameLower,
+                        "createdAt" to FieldValue.serverTimestamp(),
+                    )
+                ).await()
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    runCatching { auth.currentUser?.delete()?.await() }
+                    throw UsernameAuthException("اسم المستخدم مستخدم بالفعل. اختر اسمًا آخر.")
+                }
+                throw e
+            }
+        } else {
+            runCatching {
+                usernameDoc(norm.usernameId).set(
+                    mapOf(
+                        "uid" to uid,
+                        "usernameLower" to norm.usernameLower,
+                        "createdAt" to FieldValue.serverTimestamp(),
+                    )
+                ).await()
+            }
+        }
+
+        user().set(
+            mapOf(
+                "uid" to uid,
+                "username" to norm.username,
+                "usernameLower" to norm.usernameLower,
+                "usernameId" to norm.usernameId,
+                "createdAt" to FieldValue.serverTimestamp(),
+            )
+        ).await()
+    }
 
     // ---------- التشفير ----------
     suspend fun hasCrypto(): Boolean = cryptoDoc().get().await().exists()
@@ -110,7 +171,7 @@ class CloudRepo(
         return key
     }
 
-    /** يعيد المفتاح، أو null إذا كانت العبارة خاطئة. */
+    /** يعيد المفتاح، أو null إذا كانت كلمة المرور خاطئة. */
     suspend fun unlock(pass: CharArray): ByteArray? {
         val d = cryptoDoc().get().await()
         if (!d.exists()) return null
@@ -284,18 +345,35 @@ class CloudRepo(
         devices().document(deviceId).delete().await()
     }
 
-    /** يعيد المصادقة، يحذف كل بيانات السحابة، ثم يحذف الحساب نفسه. */
+    /** يتحقق من كلمة المرور، يحذف كل بيانات السحابة، ثم يحذف الحساب نفسه. */
     suspend fun deleteAccount(password: String) {
         val u = auth.currentUser ?: throw IllegalStateException("not signed in")
         val trimmed = password.trim()
-        if (trimmed.startsWith("eyJ")) {
-            u.reauthenticate(GoogleAuthProvider.getCredential(trimmed, null)).await()
-        } else if (trimmed.isNotEmpty() && u.email != null && u.providerData.any { it.providerId == "password" }) {
+        if (trimmed.isEmpty()) throw UsernameAuthException("يرجى إدخال كلمة المرور لتأكيد الحذف.")
+
+        if (u.email != null && u.providerData.any { it.providerId == "password" }) {
             u.reauthenticate(EmailAuthProvider.getCredential(u.email!!, trimmed)).await()
+        } else if (hasCrypto()) {
+            val verifiedKey = unlock(trimmed.toCharArray())
+                ?: throw UsernameAuthException("كلمة المرور غير صحيحة.")
+            verifiedKey.fill(0)
         }
+
+        val profileSnap = user().get().await()
+        val claimedUsernameId = profileSnap.getString("usernameId")
+
         listDevices().forEach { deleteDevice(it.id) }
-        cryptoDoc().delete().await()
-        u.delete().await()
+        runCatching { cryptoDoc().delete().await() }
+
+        val deletedViaCustomFn = UsernameAuth.deleteCustomAuthAccountIfConfigured(trimmed, auth)
+        if (!deletedViaCustomFn) {
+            if (!claimedUsernameId.isNullOrBlank()) {
+                runCatching { usernameDoc(claimedUsernameId).delete().await() }
+            }
+            runCatching { user().delete().await() }
+            u.delete().await()
+        }
+        Session.key = null
     }
 
     private companion object {

@@ -107,3 +107,23 @@ class TimeFmtTest {
         assertNull(TimeFmt.parse("not a date"))
     }
 }
+
+class UsernameAuthTest {
+    @Test fun normalizesUsernameDeterministicallyAcrossApps() {
+        val a = UsernameAuth.normalizeUsername("  sami123  ")
+        val b = UsernameAuth.normalizeUsername("SAMI123")
+        assertEquals("sami123", a.username)
+        assertEquals("sami123", a.usernameLower)
+        assertEquals(40, a.usernameId.length)
+        assertEquals(a.usernameId, b.usernameId)
+        assertEquals(a.syntheticEmail, b.syntheticEmail)
+        assertEquals("MyBackup2026!", UsernameAuth.validatePassword("MyBackup2026!"))
+    }
+
+    @Test fun rejectsInvalidUsernamesAndShortPasswords() {
+        try { UsernameAuth.normalizeUsername("ab"); fail() } catch (_: UsernameAuthException) {}
+        try { UsernameAuth.normalizeUsername("sami 123"); fail() } catch (_: UsernameAuthException) {}
+        try { UsernameAuth.validatePassword("1234567"); fail() } catch (_: UsernameAuthException) {}
+    }
+}
+

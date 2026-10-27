@@ -47,13 +47,13 @@ import app.backup.core.CloudRepo
 import app.backup.core.AuthMessages
 import app.backup.core.Net
 import app.backup.core.RecordType
+import app.backup.core.UsernameAuth
 import app.backup.core.ui.AuthGate
 import app.backup.core.ui.BackupTheme
 import app.backup.core.ui.ConfirmDialog
 import app.backup.core.ui.InfoRow
 import app.backup.core.ui.PasswordDialog
 import app.backup.core.ui.SectionTitle
-import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -65,8 +65,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             BackupTheme {
-                val done by Prefs.onboardingDone.collectAsState()
-                if (!done) Onboarding() else AuthGate { Home() }
+                AuthGate {
+                    val done by Prefs.onboardingDone.collectAsState()
+                    if (!done) Onboarding() else Home()
+                }
             }
         }
     }
@@ -196,7 +198,16 @@ fun Home() {
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
-        Text("النسخ الاحتياطي لهذا الهاتف", style = MaterialTheme.typography.headlineSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("النسخ الاحتياطي لهذا الهاتف", style = MaterialTheme.typography.headlineSmall)
+            OutlinedButton(onClick = { Scheduler.stop(ctx); UsernameAuth.signOut(ctx) }) {
+                Text("تسجيل الخروج")
+            }
+        }
         Text(
             "ينسخ هذا التطبيق الأنواع المفعّلة أدناه إلى حسابك السحابي مشفّرةً، ويمكنك مراجعتها وحذفها في أي وقت.",
             style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp),
@@ -205,6 +216,7 @@ fun Home() {
 
         OutlinedCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp)) {
+                UsernameAuth.savedUsername(ctx)?.let { InfoRow("اسم المستخدم", it) }
                 InfoRow("اسم الجهاز", name)
                 InfoRow("حالة النسخ", status)
                 InfoRow("الاتصال بالإنترنت", if (online) "متصل" else "غير متصل")
@@ -273,7 +285,7 @@ fun Home() {
         ActionButton("حذف النسخة السحابية لهذا الجهاز") { confirm = "cloud" }
         ActionButton("حذف السجلات المحلية من هذا الهاتف") { confirm = "local" }
         ActionButton("إزالة هذا الجهاز من الحساب وتسجيل الخروج") { confirm = "device" }
-        ActionButton("تسجيل الخروج") { Scheduler.stop(ctx); FirebaseAuth.getInstance().signOut() }
+        ActionButton("تسجيل الخروج") { Scheduler.stop(ctx); UsernameAuth.signOut(ctx) }
         ActionButton("حذف الحساب وكل بياناته") { confirm = "account" }
         Spacer(Modifier.height(24.dp))
     }
@@ -286,8 +298,8 @@ fun Home() {
                 when (kind) {
                     "cloud" -> { repo.deleteRecords(Prefs.deviceId); message = "حُذفت النسخة السحابية لهذا الجهاز فقط. السجلات المحلية باقية على هاتفك ولن تُرفع من جديد إلا إذا اخترت «إعادة رفع»." }
                     "local" -> { dao.deleteAll(); message = "حُذفت السجلات المحلية فقط، والنسخة السحابية باقية." }
-                    "device" -> { Scheduler.stop(ctx); repo.deleteDevice(Prefs.deviceId); FirebaseAuth.getInstance().signOut() }
-                    "account" -> { Scheduler.stop(ctx); repo.deleteAccount(password!!); dao.deleteAll(); Prefs.resetAll() }
+                    "device" -> { Scheduler.stop(ctx); repo.deleteDevice(Prefs.deviceId); UsernameAuth.signOut(ctx) }
+                    "account" -> { Scheduler.stop(ctx); repo.deleteAccount(password!!); dao.deleteAll(); Prefs.resetAll(); UsernameAuth.signOut(ctx) }
                 }
             } catch (e: Exception) { message = AuthMessages.of(e) }
         }
